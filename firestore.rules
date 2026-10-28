@@ -37,9 +37,9 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // Koleksi users: Pengguna dapat membaca & membuat/mengupdate dokumen profilnya sendiri saat sinkronisasi
+    // Koleksi users: Izinkan pembacaan dokumen profil (diperlukan untuk lookup username/NIM/NIDN pada form login)
     match /users/{userId} {
-      allow read: if isAuthenticated();
+      allow read: if true;
       allow create: if isAdmin() || (isAuthenticated() && request.auth.uid == userId);
       allow update: if isAdmin() || (
         request.auth.uid == userId && 
