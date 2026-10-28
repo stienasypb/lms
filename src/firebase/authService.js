@@ -4,6 +4,7 @@
  */
 import { 
   signInWithEmailAndPassword, 
+  createUserWithEmailAndPassword,
   signOut as firebaseSignOut, 
   onAuthStateChanged,
   sendPasswordResetEmail 
@@ -188,36 +189,95 @@ export async function loginUser(identifier, password) {
     }
 
     // Jika akun Firebase Auth tersedia, gunakan sesi Firebase sebagai sumber
-    // otorisasi Firestore. Sebelumnya akun lokal selalu langsung dianggap login,
-    // sehingga listener Firestore berjalan tanpa request.auth dan mendapat
-    // permission-denied.
+    // otorisasi Firestore.
     if (isRealFirebaseConfigured() && auth && foundUser.email) {
+      const targetEmail = foundUser.email.toLowerCase().trim();
+      let firebaseUser = null;
+
       try {
         const userCredential = await signInWithEmailAndPassword(
           auth,
-          foundUser.email.toLowerCase().trim(),
+          targetEmail,
           rawPass
         );
-        const firebaseUser = userCredential.user;
-        const profileSnap = await getDoc(doc(db, 'users', firebaseUser.uid));
-        if (!profileSnap.exists() || !profileSnap.data().role) {
-          await firebaseSignOut(auth);
-          throw new Error('Akun Firebase berhasil diverifikasi, tetapi profil cloud/role belum disiapkan. Minta administrator menghubungkan profil lama dengan UID Firebase Anda.');
+        firebaseUser = userCredential.user;
+      } catch (firebaseError) {
+        console.warn('Firebase Auth sign in failed, memeriksa opsi auto-sync:', firebaseError.code || firebaseError.message);
+
+        // Jika akun belum dibuat di Firebase Auth, lakukan auto-registration / migrasi otomatis
+        if (
+          firebaseError.code === 'auth/user-not-found' ||
+          firebaseError.code === 'auth/invalid-credential' ||
+          firebaseError.code === 'auth/invalid-login-credentials'
+        ) {
+          if (rawPass.length < 6) {
+            throw new Error('Kata sandi untuk autentikasi Firebase minimal 6 karakter. Silakan periksa kembali kata sandi akun Anda.');
+          }
+
+          try {
+            // Otomatis daftarkan akun ke Firebase Auth
+            const newCredential = await createUserWithEmailAndPassword(
+              auth,
+              targetEmail,
+              rawPass
+            );
+            firebaseUser = newCredential.user;
+            console.log('Akun berhasil di-auto-sync ke Firebase Auth:', targetEmail);
+          } catch (createErr) {
+            if (createErr.code === 'auth/email-already-in-use') {
+              // Jika email sudah terdaftar di Firebase Auth tapi signIn gagal, berarti password salah
+              throw new Error('Kata sandi yang Anda masukkan salah. Silakan periksa kembali kata sandi akun Anda.');
+            }
+            throw new Error(describeFirebaseLoginError(createErr));
+          }
+        } else {
+          throw new Error(describeFirebaseLoginError(firebaseError));
         }
-        const profile = profileSnap.data();
+      }
+
+      if (firebaseUser) {
+        // Ambil profil dari Firestore
+        let profile = null;
+        try {
+          const profileSnap = await getDoc(doc(db, 'users', firebaseUser.uid));
+          if (profileSnap.exists() && profileSnap.data().role) {
+            profile = profileSnap.data();
+          }
+        } catch (e) {
+          console.warn('Gagal membaca profil dari Firestore:', e);
+        }
+
+        // Jika dokumen profil belum ada di Firestore (misalnya akun baru disinkronkan),
+        // otomatis buatkan dokumen profil dari data foundUser!
+        if (!profile || !profile.role) {
+          const syncData = {
+            ...foundUser,
+            uid: firebaseUser.uid,
+            id: firebaseUser.uid,
+            email: targetEmail,
+            syncedAt: new Date().toISOString()
+          };
+          delete syncData.password;
+
+          try {
+            await setDoc(doc(db, 'users', firebaseUser.uid), syncData, { merge: true });
+            profile = syncData;
+          } catch (errSet) {
+            console.warn('Gagal menyimpan profil sync ke Firestore:', errSet);
+            profile = syncData;
+          }
+        }
+
         if (profile.isActive === false) {
           await firebaseSignOut(auth);
           throw new Error('Akun Anda berstatus non-aktif / dibekukan. Silakan hubungi Administrator STIE Nasional.');
         }
+
         const cloudUser = { ...profile, uid: firebaseUser.uid, id: firebaseUser.uid, email: firebaseUser.email };
         localStorage.setItem('STIE_LMS_ACTIVE_USER', JSON.stringify(cloudUser));
         recordUserActivity();
         localStorage.removeItem('STIE_LMS_SESSION_EXPIRED');
         return cloudUser;
-      } catch (firebaseError) {
-        console.warn('Firebase Auth gagal:', firebaseError.code || firebaseError.message);
-        if (firebaseError.message?.includes('profil cloud/role') || firebaseError.message?.includes('berstatus non-aktif')) throw firebaseError;
-        throw new Error(describeFirebaseLoginError(firebaseError));
       }
     }
     throw new Error('Akun ini belum dapat digunakan karena Firebase Authentication belum aktif.');
@@ -231,10 +291,35 @@ export async function loginUser(identifier, password) {
       const user = userCredential.user;
 
       const userDocRef = doc(db, "users", user.uid);
-      const userSnap = await getDoc(userDocRef);
+      let userSnap = await getDoc(userDocRef);
+      let userData = null;
 
-      if (userSnap.exists()) {
-        const userData = userSnap.data();
+      if (userSnap.exists() && userSnap.data().role) {
+        userData = userSnap.data();
+      } else {
+        // Cari apakah ada data awal yang cocok dengan email ini di INITIAL_USERS
+        const matchSeed = INITIAL_USERS.find(
+          u => (u.email || '').toLowerCase() === normalizedEmail.toLowerCase()
+        );
+        if (matchSeed) {
+          const syncData = {
+            ...matchSeed,
+            uid: user.uid,
+            id: user.uid,
+            email: normalizedEmail,
+            syncedAt: new Date().toISOString()
+          };
+          delete syncData.password;
+          try {
+            await setDoc(userDocRef, syncData, { merge: true });
+            userData = syncData;
+          } catch (e) {
+            userData = syncData;
+          }
+        }
+      }
+
+      if (userData) {
         if (userData.isActive === false) {
           await firebaseSignOut(auth);
           throw new Error("Akun Anda berstatus non-aktif. Silakan hubungi Administrator STIE Nasional.");

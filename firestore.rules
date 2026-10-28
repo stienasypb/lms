@@ -37,15 +37,10 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // Koleksi users: Pengguna dapat mengedit profil diri sendiri, role & isActive hanya oleh Admin
+    // Koleksi users: Pengguna dapat membaca & membuat/mengupdate dokumen profilnya sendiri saat sinkronisasi
     match /users/{userId} {
       allow read: if isAuthenticated();
-      allow create: if isAdmin() || (
-        isAuthenticated() &&
-        request.auth.uid == userId &&
-        request.resource.data.role == 'MAHASISWA' &&
-        request.resource.data.isActive == true
-      );
+      allow create: if isAdmin() || (isAuthenticated() && request.auth.uid == userId);
       allow update: if isAdmin() || (
         request.auth.uid == userId && 
         !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'isActive'])
