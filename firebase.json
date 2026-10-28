@@ -1,5 +1,6 @@
 {
   "hosting": {
+    "target": "lms-stienasbjm",
     "public": "dist",
     "ignore": [
       "firebase.json",
