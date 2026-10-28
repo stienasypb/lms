@@ -38,7 +38,11 @@ export function AuthProvider({ children }) {
       }
       try {
         const profileSnap = await getDoc(doc(db, 'users', firebaseUser.uid));
-        const profile = profileSnap.exists() ? profileSnap.data() : {};
+        if (!profileSnap.exists() || !profileSnap.data().role) {
+          setUser(current => current?.uid === firebaseUser.uid && current?.role ? current : null);
+          return;
+        }
+        const profile = profileSnap.data();
         setUser({ ...profile, uid: firebaseUser.uid, id: firebaseUser.uid, email: firebaseUser.email });
       } catch (error) {
         console.warn('Gagal memuat profil Firebase:', error);

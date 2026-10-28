@@ -23,6 +23,23 @@ export function normalizeLoginIdentifier(identifier) {
   return `${trimmed}@lms.stienas.ac.id`;
 }
 
+function describeFirebaseLoginError(error) {
+  switch (error?.code) {
+    case 'auth/invalid-credential':
+    case 'auth/wrong-password':
+    case 'auth/user-not-found':
+      return 'Email atau kata sandi tidak cocok, atau akun belum dibuat di Firebase Authentication. Akun dari data lokal lama tidak otomatis menjadi akun Firebase.';
+    case 'auth/too-many-requests':
+      return 'Login sementara dibatasi karena terlalu banyak percobaan. Coba lagi beberapa saat atau gunakan Lupa Kata Sandi.';
+    case 'auth/network-request-failed':
+      return 'Tidak dapat terhubung ke Firebase Authentication. Periksa koneksi internet lalu coba lagi.';
+    case 'auth/operation-not-allowed':
+      return 'Login email/kata sandi belum diaktifkan pada Firebase Authentication project ini.';
+    default:
+      return 'Login Firebase gagal. Periksa email, kata sandi, dan koneksi akun Firebase Anda.';
+  }
+}
+
 // =========================================================================
 // MEKANISME SESSION TIMEOUT & INACTIVITY TIMEOUT (15 MENIT)
 // =========================================================================
@@ -156,7 +173,6 @@ export async function loginUser(identifier, password) {
         if (uEmail === trimmed || uUser === trimmed || uNim === trimmed) {
           foundUser = uData;
           combinedUsers.push(uData);
-          localStorage.setItem('STIE_LMS_USERS', JSON.stringify(combinedUsers));
           break;
         }
       }
@@ -184,15 +200,24 @@ export async function loginUser(identifier, password) {
         );
         const firebaseUser = userCredential.user;
         const profileSnap = await getDoc(doc(db, 'users', firebaseUser.uid));
-        const profile = profileSnap.exists() ? profileSnap.data() : {};
-        const cloudUser = { ...foundUser, ...profile, uid: firebaseUser.uid, id: firebaseUser.uid, email: firebaseUser.email };
+        if (!profileSnap.exists() || !profileSnap.data().role) {
+          await firebaseSignOut(auth);
+          throw new Error('Akun Firebase berhasil diverifikasi, tetapi profil cloud/role belum disiapkan. Minta administrator menghubungkan profil lama dengan UID Firebase Anda.');
+        }
+        const profile = profileSnap.data();
+        if (profile.isActive === false) {
+          await firebaseSignOut(auth);
+          throw new Error('Akun Anda berstatus non-aktif / dibekukan. Silakan hubungi Administrator STIE Nasional.');
+        }
+        const cloudUser = { ...profile, uid: firebaseUser.uid, id: firebaseUser.uid, email: firebaseUser.email };
         localStorage.setItem('STIE_LMS_ACTIVE_USER', JSON.stringify(cloudUser));
         recordUserActivity();
         localStorage.removeItem('STIE_LMS_SESSION_EXPIRED');
         return cloudUser;
       } catch (firebaseError) {
         console.warn('Firebase Auth gagal:', firebaseError.code || firebaseError.message);
-        throw new Error('Login Firebase gagal. Pastikan akun ini sudah terdaftar pada Firebase Authentication.');
+        if (firebaseError.message?.includes('profil cloud/role') || firebaseError.message?.includes('berstatus non-aktif')) throw firebaseError;
+        throw new Error(describeFirebaseLoginError(firebaseError));
       }
     }
     throw new Error('Akun ini belum dapat digunakan karena Firebase Authentication belum aktif.');
@@ -220,22 +245,13 @@ export async function loginUser(identifier, password) {
         localStorage.removeItem('STIE_LMS_SESSION_EXPIRED');
         return fullProfile;
       } else {
-        const newProfile = {
-          uid: user.uid,
-          email: user.email,
-          name: user.displayName || user.email.split('@')[0],
-          role: 'MAHASISWA',
-          isActive: true,
-          createdAt: new Date().toISOString()
-        };
-        await setDoc(userDocRef, newProfile);
-        localStorage.setItem('STIE_LMS_ACTIVE_USER', JSON.stringify(newProfile));
-        recordUserActivity();
-        localStorage.removeItem('STIE_LMS_SESSION_EXPIRED');
-        return newProfile;
+        await firebaseSignOut(auth);
+        throw new Error('Akun Firebase ini belum memiliki profil LMS. Hubungi administrator untuk menautkan akun dan peran Anda.');
       }
     } catch (fbErr) {
       console.warn("Firebase sign in error:", fbErr);
+      if (fbErr.message?.includes('belum memiliki profil LMS') || fbErr.message?.includes('berstatus non-aktif')) throw fbErr;
+      throw new Error(describeFirebaseLoginError(fbErr));
     }
   }
 

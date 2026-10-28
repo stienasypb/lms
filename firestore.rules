@@ -32,13 +32,20 @@ service cloud.firestore {
 
     // Default deny for unauthenticated
     match /{document=**} {
-      allow read, write: if isAuthenticated();
+      // Jangan memberi izin global: aturan allow yang cocok bersifat OR,
+      // sehingga catch-all authenticated sebelumnya melewati pembatasan role.
+      allow read, write: if false;
     }
 
     // Koleksi users: Pengguna dapat mengedit profil diri sendiri, role & isActive hanya oleh Admin
     match /users/{userId} {
       allow read: if isAuthenticated();
-      allow create: if isAuthenticated();
+      allow create: if isAdmin() || (
+        isAuthenticated() &&
+        request.auth.uid == userId &&
+        request.resource.data.role == 'MAHASISWA' &&
+        request.resource.data.isActive == true
+      );
       allow update: if isAdmin() || (
         request.auth.uid == userId && 
         !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'isActive'])
