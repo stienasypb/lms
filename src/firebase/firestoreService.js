@@ -3002,13 +3002,14 @@ export async function editClassMessage(classId, messageId, newText, user) {
 export async function deleteClassMessage(classId, messageId, user) {
   if (!classId || !messageId || !user) return;
   const key = `${CLASS_MESSAGES_KEY_PREFIX}${classId}`;
+  const normalizedMessageId = String(messageId);
   const existing = await getClassMessages(classId);
   const userId = user.uid || user.id;
   const role = (user.role || '').toUpperCase();
   const canModerate = ['SUPER_ADMIN', 'ADMIN', 'ADMIN_AKADEMIK', 'BAA', 'DOSEN'].includes(role);
 
   // Cari pesan yang akan dihapus untuk validasi kepemilikan
-  const targetMsg = existing.find(msg => msg.id === messageId);
+  const targetMsg = existing.find(msg => String(msg.id) === normalizedMessageId);
   if (targetMsg) {
     const isOwner = targetMsg.senderId === userId ||
                     String(targetMsg.senderId) === String(user.id) ||
@@ -3020,23 +3021,62 @@ export async function deleteClassMessage(classId, messageId, user) {
   }
 
   // Hard delete: hapus pesan dari array sepenuhnya
-  const updatedMessages = existing.filter(msg => msg.id !== messageId);
+  const updatedMessages = existing.filter(msg => String(msg.id) !== normalizedMessageId);
 
   if (isCloudSessionActive()) {
-    const messageDocs = await getDocs(collection(db, "kelas_kuliah", String(classId), "pesan_diskusi"));
+    const classRef = doc(db, "kelas_kuliah", String(classId));
+    const [messageDocs, classSnap] = await Promise.all([
+      getDocs(collection(db, "kelas_kuliah", String(classId), "pesan_diskusi")),
+      getDoc(classRef)
+    ]);
     const matchingDocs = messageDocs.docs.filter(snapshot =>
-      snapshot.id === String(messageId) || snapshot.data().id === messageId
+      snapshot.id === normalizedMessageId || String(snapshot.data().id || '') === normalizedMessageId
     );
+    const legacyMessages = classSnap.exists() && Array.isArray(classSnap.data().messages)
+      ? classSnap.data().messages
+      : [];
+    const legacyHasMessage = legacyMessages.some(message => String(message?.id || '') === normalizedMessageId);
     const batch = writeBatch(db);
+    let operationCount = 0;
+    if (legacyHasMessage && !canModerate) {
+      throw new Error('Pesan ini juga memiliki salinan data lama. Minta dosen atau administrator menghapusnya agar tidak muncul kembali.');
+    }
     if (matchingDocs.length > 0) {
       // Hard delete dari subkoleksi. Error remote sengaja diteruskan agar UI
       // tidak mengklaim berhasil ketika Firestore menolak penghapusan.
-      matchingDocs.forEach(snapshot => batch.delete(snapshot.ref));
-    } else {
-      // Dukungan data legacy yang masih berada pada array parent.
-      batch.set(doc(db, "kelas_kuliah", String(classId)), { messages: updatedMessages }, { merge: true });
+      matchingDocs.forEach(snapshot => {
+        batch.delete(snapshot.ref);
+        operationCount += 1;
+      });
     }
-    await batch.commit();
+    // Data chat versi lama pernah disimpan di dua tempat. Menghapus hanya
+    // subkoleksi membuat salinan pada kelas.messages muncul kembali saat load.
+    // Admin/dosen berwenang memperbarui dokumen kelas untuk membuang salinan itu.
+    if (legacyHasMessage && canModerate) {
+      batch.set(classRef, {
+        messages: legacyMessages.filter(message => String(message?.id || '') !== normalizedMessageId)
+      }, { merge: true });
+      operationCount += 1;
+    } else if (matchingDocs.length === 0 && legacyHasMessage) {
+      throw new Error('Pesan lama tersimpan pada data kelas. Hubungi dosen atau administrator untuk menghapus salinan legacy dengan aman.');
+    } else if (matchingDocs.length === 0) {
+      throw new Error('Pesan tidak ditemukan lagi di Firestore. Muat ulang ruang diskusi.');
+    }
+    if (operationCount > 0) await batch.commit();
+
+    // Verifikasi penghapusan dari sumber cloud sebelum UI menyatakan berhasil.
+    const [remainingDocs, refreshedClass] = await Promise.all([
+      getDocs(collection(db, "kelas_kuliah", String(classId), "pesan_diskusi")),
+      getDoc(classRef)
+    ]);
+    const stillInSubcollection = remainingDocs.docs.some(snapshot =>
+      snapshot.id === normalizedMessageId || String(snapshot.data().id || '') === normalizedMessageId
+    );
+    const stillInLegacyArray = refreshedClass.exists() && Array.isArray(refreshedClass.data().messages)
+      && refreshedClass.data().messages.some(message => String(message?.id || '') === normalizedMessageId);
+    if (stillInSubcollection || (canModerate && stillInLegacyArray)) {
+      throw new Error('Firestore belum menghapus seluruh salinan pesan. Periksa izin database lalu coba lagi.');
+    }
   } else {
     try { localStorage.setItem(key, JSON.stringify(updatedMessages)); } catch (e) {}
     try {
