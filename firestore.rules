@@ -14,16 +14,20 @@ service cloud.firestore {
     }
     
     // Helper function: check role
-    function hasRole(role) {
-      return isAuthenticated() && getUserData().role == role;
-    }
-    
     function isAdmin() {
       return isAuthenticated() && (getUserData().role == 'SUPER_ADMIN' || getUserData().role == 'ADMIN_AKADEMIK');
     }
     
     function isDosen() {
       return isAuthenticated() && getUserData().role == 'DOSEN';
+    }
+
+    function canAccessClass(classId) {
+      return isAuthenticated() && (
+        isAdmin() ||
+        get(/databases/$(database)/documents/kelas_kuliah/$(classId)).data.dosenId == request.auth.uid ||
+        request.auth.uid in get(/databases/$(database)/documents/kelas_kuliah/$(classId)).data.enrolledStudents
+      );
     }
 
     // Default deny for unauthenticated
@@ -68,6 +72,24 @@ service cloud.firestore {
       allow read: if isAuthenticated();
       allow create: if isAdmin() || isDosen();
       allow update, delete: if isAdmin() || (isDosen() && resource.data.dosenId == request.auth.uid);
+
+      // Chat memakai subkoleksi agar mahasiswa tidak perlu mengubah dokumen
+      // kelas induk. Pengirim hanya boleh mengubah/menghapus pesannya sendiri;
+      // dosen pengampu dan admin dapat memoderasi seluruh ruang kelas.
+      match /pesan_diskusi/{messageId} {
+        allow read: if canAccessClass(kelasId);
+        allow create: if canAccessClass(kelasId)
+          && request.resource.data.senderId == request.auth.uid;
+        allow update: if canAccessClass(kelasId)
+          && (isAdmin()
+            || get(/databases/$(database)/documents/kelas_kuliah/$(kelasId)).data.dosenId == request.auth.uid
+            || resource.data.senderId == request.auth.uid)
+          && request.resource.data.senderId == resource.data.senderId;
+        allow delete: if canAccessClass(kelasId)
+          && (isAdmin()
+            || get(/databases/$(database)/documents/kelas_kuliah/$(kelasId)).data.dosenId == request.auth.uid
+            || resource.data.senderId == request.auth.uid);
+      }
 
       // Subkoleksi Enrollments
       match /enrollments/{mhsId} {

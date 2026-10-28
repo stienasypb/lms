@@ -1,4 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
+import { onAuthStateChanged } from 'firebase/auth';
+import { doc, getDoc } from 'firebase/firestore';
 import { 
   getCurrentUser, 
   loginUser, 
@@ -7,7 +9,7 @@ import {
   WARNING_BEFORE_TIMEOUT_MS, 
   recordUserActivity 
 } from '../firebase/authService';
-import { isRealFirebaseConfigured } from '../firebase/config';
+import { auth, db, isRealFirebaseConfigured } from '../firebase/config';
 import { subscribeToDocFirestore } from '../firebase/firestoreService';
 import { INITIAL_USERS } from '../utils/seedData';
 import SessionTimeoutModal from '../components/common/SessionTimeoutModal';
@@ -22,7 +24,28 @@ export function AuthProvider({ children }) {
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [isFirebaseLive, setIsFirebaseLive] = useState(isRealFirebaseConfigured());
+  const [isFirebaseLive, setIsFirebaseLive] = useState(Boolean(isRealFirebaseConfigured() && auth?.currentUser));
+
+  // Status "Live" hanya boleh ditampilkan ketika Firebase Auth benar-benar
+  // memiliki sesi. Konfigurasi API saja tidak cukup untuk membaca Firestore.
+  useEffect(() => {
+    if (!auth) return undefined;
+    return onAuthStateChanged(auth, async firebaseUser => {
+      setIsFirebaseLive(Boolean(firebaseUser));
+      if (!firebaseUser) {
+        setUser(null);
+        return;
+      }
+      try {
+        const profileSnap = await getDoc(doc(db, 'users', firebaseUser.uid));
+        const profile = profileSnap.exists() ? profileSnap.data() : {};
+        setUser({ ...profile, uid: firebaseUser.uid, id: firebaseUser.uid, email: firebaseUser.email });
+      } catch (error) {
+        console.warn('Gagal memuat profil Firebase:', error);
+        setUser(null);
+      }
+    });
+  }, []);
 
   // State untuk Session Inactivity Timeout
   const [showTimeoutWarning, setShowTimeoutWarning] = useState(false);
@@ -162,8 +185,9 @@ export function AuthProvider({ children }) {
   };
 
   const setSpecificUser = (targetUser) => {
+    if (isRealFirebaseConfigured() && !auth?.currentUser) return null;
     setUser(targetUser);
-    localStorage.setItem('STIE_LMS_ACTIVE_USER', JSON.stringify(targetUser));
+    if (!isRealFirebaseConfigured()) localStorage.setItem('STIE_LMS_ACTIVE_USER', JSON.stringify(targetUser));
     recordUserActivity();
     localStorage.removeItem('STIE_LMS_SESSION_EXPIRED');
     setShowTimeoutWarning(false);
@@ -172,7 +196,7 @@ export function AuthProvider({ children }) {
   const updateCurrentUserProfile = (updates) => {
     setUser(prev => {
       const updated = { ...prev, ...updates };
-      localStorage.setItem('STIE_LMS_ACTIVE_USER', JSON.stringify(updated));
+      if (!isRealFirebaseConfigured()) localStorage.setItem('STIE_LMS_ACTIVE_USER', JSON.stringify(updated));
       return updated;
     });
   };

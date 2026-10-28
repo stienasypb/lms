@@ -72,6 +72,8 @@ export async function loginUser(identifier, password) {
       const parsed = JSON.parse(stored);
       if (Array.isArray(parsed)) {
         parsed.forEach(storedU => {
+          const { password, ...safeStoredUser } = storedU;
+          storedU = safeStoredUser;
           const key = storedU.uid || storedU.id || storedU.email;
           if (key) {
             const existing = userMap.get(String(key).toLowerCase());
@@ -169,35 +171,31 @@ export async function loginUser(identifier, password) {
       throw new Error("Akun Anda berstatus non-aktif / dibekukan. Silakan hubungi Administrator STIE Nasional.");
     }
 
-    const expectedPassword = foundUser.password ? String(foundUser.password).trim() : '';
-    const uRole = (foundUser.role || '').toUpperCase();
-
-    // Verifikasi kata sandi — harus cocok dengan password yang tersimpan di akun
-    let isPasswordValid = (rawPass === expectedPassword);
-
-    // Fallback password resmi Admin Sistem (admin126) — hanya jika password di akun berbeda
-    if (!isPasswordValid && (uRole === 'SUPER_ADMIN' || uRole === 'ADMIN')) {
-      if (rawPass === 'admin126') {
-        isPasswordValid = true;
+    // Jika akun Firebase Auth tersedia, gunakan sesi Firebase sebagai sumber
+    // otorisasi Firestore. Sebelumnya akun lokal selalu langsung dianggap login,
+    // sehingga listener Firestore berjalan tanpa request.auth dan mendapat
+    // permission-denied.
+    if (isRealFirebaseConfigured() && auth && foundUser.email) {
+      try {
+        const userCredential = await signInWithEmailAndPassword(
+          auth,
+          foundUser.email.toLowerCase().trim(),
+          rawPass
+        );
+        const firebaseUser = userCredential.user;
+        const profileSnap = await getDoc(doc(db, 'users', firebaseUser.uid));
+        const profile = profileSnap.exists() ? profileSnap.data() : {};
+        const cloudUser = { ...foundUser, ...profile, uid: firebaseUser.uid, id: firebaseUser.uid, email: firebaseUser.email };
+        localStorage.setItem('STIE_LMS_ACTIVE_USER', JSON.stringify(cloudUser));
+        recordUserActivity();
+        localStorage.removeItem('STIE_LMS_SESSION_EXPIRED');
+        return cloudUser;
+      } catch (firebaseError) {
+        console.warn('Firebase Auth gagal:', firebaseError.code || firebaseError.message);
+        throw new Error('Login Firebase gagal. Pastikan akun ini sudah terdaftar pada Firebase Authentication.');
       }
     }
-
-    // Dosen dan Mahasiswa: hanya cocok dengan password yang tersimpan di akun
-    // (tidak ada fallback generik — keamanan lebih ketat)
-
-    if (!isPasswordValid) {
-      throw new Error("Kata sandi yang Anda masukkan salah. Silakan periksa kembali kata sandi akun Anda.");
-    }
-
-    // Password valid: Login berhasil
-    const activeUser = {
-      ...foundUser
-    };
-
-    localStorage.setItem('STIE_LMS_ACTIVE_USER', JSON.stringify(activeUser));
-    recordUserActivity();
-    localStorage.removeItem('STIE_LMS_SESSION_EXPIRED');
-    return activeUser;
+    throw new Error('Akun ini belum dapat digunakan karena Firebase Authentication belum aktif.');
   }
 
   // 3. Jika tidak ditemukan di lokal dan Firebase asli dikonfigurasi:
@@ -263,6 +261,9 @@ export async function logoutUser() {
  * Dapatkan user tersimpan dari local state dengan validasi Session Inactivity Timeout
  */
 export function getCurrentUser() {
+  // Saat Firebase terkonfigurasi, sesi lokal tidak boleh menjadi bukti login.
+  // Profil lokal lama hanya boleh dipakai oleh mode demo tanpa Firebase.
+  if (isRealFirebaseConfigured()) return null;
   try {
     const saved = localStorage.getItem('STIE_LMS_ACTIVE_USER');
     if (!saved) return null;
@@ -455,6 +456,14 @@ export async function directResetPassword(identifier, newPassword) {
     throw new Error("Kata sandi baru minimal 6 karakter.");
   }
 
+  if (isRealFirebaseConfigured() && auth) {
+    if (!trimmed.includes('@')) {
+      throw new Error('Untuk keamanan, reset password Firebase harus menggunakan alamat email akun.');
+    }
+    await sendPasswordResetEmail(auth, trimmed);
+    return { success: true, email: trimmed, sentViaFirebase: true };
+  }
+
   let list = [];
   try {
     list = await getUsers();
@@ -479,34 +488,7 @@ export async function directResetPassword(identifier, newPassword) {
 
   const targetUid = target.uid || target.id;
 
-  // Perbarui kata sandi di state lokal
-  const updatedList = list.map(u => {
-    if ((targetUid && (u.uid === targetUid || u.id === targetUid)) || (u.email && u.email.toLowerCase().trim() === target.email.toLowerCase().trim())) {
-      return {
-        ...u,
-        password: cleanPass
-      };
-    }
-    return u;
-  });
-
-  localStorage.setItem('STIE_LMS_USERS', JSON.stringify(updatedList));
-
-  // Coba perbarui di Firestore jika online
-  if (isRealFirebaseConfigured() && db && targetUid) {
-    try {
-      await updateDoc(doc(db, "users", String(targetUid)), { password: cleanPass });
-    } catch (e) {
-      console.warn("Direct Firestore directResetPassword updateDoc warning:", e);
-    }
-  }
-
-  return {
-    success: true,
-    name: target.name,
-    email: target.email,
-    nim: target.nim
-  };
+  throw new Error('Reset password lokal dinonaktifkan. Gunakan Firebase Authentication.');
 }
 
 export { registerStudent } from './firestoreService.js';

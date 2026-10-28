@@ -17,10 +17,12 @@ import {
   where, 
   orderBy, 
   serverTimestamp,
-  onSnapshot 
+  onSnapshot,
+  arrayUnion
 } from "firebase/firestore";
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
-import { db, storage, isRealFirebaseConfigured } from "./config.js";
+import { createUserWithEmailAndPassword } from "firebase/auth";
+import { auth, db, storage, isRealFirebaseConfigured } from "./config.js";
 import { 
   INITIAL_FAKULTAS, 
   INITIAL_PRODI, 
@@ -47,6 +49,12 @@ export const STORAGE_KEYS = {
 };
 
 export const DATA_SYNC_EVENT = 'stie_data_sync';
+
+// Data akademik tidak boleh dianggap tersimpan di cloud hanya karena Firebase
+// terkonfigurasi. Firestore Rules membutuhkan request.auth yang valid.
+export function isCloudSessionActive() {
+  return Boolean(isRealFirebaseConfigured() && db && auth?.currentUser);
+}
 
 export function notifyDataChange(key, value) {
   if (typeof window !== 'undefined') {
@@ -82,7 +90,7 @@ export function subscribeToDataSync(callback) {
  * @returns {function} Fungsi unsubscribe untuk cleanup
  */
 export function subscribeToFirestore(collectionName, callback, queryOptions = {}) {
-  if (!isRealFirebaseConfigured() || !db) return () => {};
+  if (!isCloudSessionActive()) return () => {};
 
   try {
     let q;
@@ -106,7 +114,9 @@ export function subscribeToFirestore(collectionName, callback, queryOptions = {}
           return data;
         });
 
-        // Simpan langsung data terbaru ke localStorage cache agar konsisten di seluruh browser/tab
+        // Dalam sesi cloud, Firestore adalah sumber tunggal. Jangan menyalin
+        // koleksi akademik ke localStorage; cache lokal hanya dipakai fallback
+        // ketika aplikasi benar-benar berjalan tanpa Firebase Auth.
         try {
           const keyMap = {
             'users': STORAGE_KEYS.USERS,
@@ -117,7 +127,7 @@ export function subscribeToFirestore(collectionName, callback, queryOptions = {}
             'fakultas': STORAGE_KEYS.FAKULTAS
           };
           const storageKey = keyMap[collectionName];
-          if (storageKey && typeof localStorage !== 'undefined' && items.length > 0) {
+          if (storageKey && !isCloudSessionActive() && typeof localStorage !== 'undefined' && items.length > 0) {
             localStorage.setItem(storageKey, JSON.stringify(items));
             notifyDataChange(storageKey, items);
           }
@@ -144,7 +154,7 @@ export function subscribeToFirestore(collectionName, callback, queryOptions = {}
  * @returns {function} Fungsi unsubscribe untuk cleanup
  */
 export function subscribeToDocFirestore(collectionName, docId, callback) {
-  if (!isRealFirebaseConfigured() || !db || !docId) return () => {};
+  if (!isCloudSessionActive() || !docId) return () => {};
 
   try {
     const unsubscribe = onSnapshot(
@@ -248,8 +258,9 @@ export function saveMeetingConfig(classId, meetingNumber, config) {
 
 export async function getLocal(key, initial = []) {
   let localItems = null;
+  const cloudSession = isCloudSessionActive();
   try {
-    if (typeof localStorage !== 'undefined') {
+    if (!cloudSession && typeof localStorage !== 'undefined') {
       const raw = localStorage.getItem(key);
       if (raw) {
         localItems = JSON.parse(raw);
@@ -260,7 +271,7 @@ export async function getLocal(key, initial = []) {
   }
 
   let fbLoaded = false;
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     const colName = getCollectionName(key);
     if (colName) {
       try {
@@ -268,6 +279,7 @@ export async function getLocal(key, initial = []) {
         if (!snap.empty) {
           let remoteItems = snap.docs.map(d => {
             const data = d.data();
+            if (key === STORAGE_KEYS.USERS) delete data.password;
             if (!data.uid && !data.id) {
                data.id = d.id;
             }
@@ -418,7 +430,7 @@ export async function getLocal(key, initial = []) {
             }
           }
 
-          if (typeof localStorage !== 'undefined') {
+          if (!cloudSession && typeof localStorage !== 'undefined') {
             localStorage.setItem(key, JSON.stringify(finalItems));
           }
           fbLoaded = true;
@@ -531,7 +543,7 @@ export async function getLocal(key, initial = []) {
 
 export async function setLocal(key, value) {
   try {
-    if (typeof localStorage !== 'undefined') {
+    if (!isCloudSessionActive() && typeof localStorage !== 'undefined') {
       localStorage.setItem(key, JSON.stringify(value));
     }
     notifyDataChange(key, value);
@@ -638,7 +650,9 @@ export async function initializeLocalStore() {
     }
   } catch (e) {}
 
-  const currentUsers = await getLocal(STORAGE_KEYS.USERS, INITIAL_USERS);
+  const storedUsers = await getLocal(STORAGE_KEYS.USERS, INITIAL_USERS);
+  const usersContainPasswords = storedUsers.some(user => Object.prototype.hasOwnProperty.call(user, 'password'));
+  const currentUsers = storedUsers.map(({ password, ...user }) => user);
   // Hapus akun dummy/sampel lama (bukan akun riil)
   const dummyUids = ['user-mhs-4', 'user-mhs-1', 'user-mhs-2', 'user-mhs-3', 'user-mahasiswa-1789742014560'];
   let sanitizedUsers = currentUsers.filter(u => {
@@ -646,7 +660,7 @@ export async function initializeLocalStore() {
     return !dummyUids.includes(uid) && u.email !== 'mahasiswa@stienas.ac.id';
   });
 
-  let usersChanged = sanitizedUsers.length !== currentUsers.length;
+  let usersChanged = usersContainPasswords || sanitizedUsers.length !== currentUsers.length;
   // Pastikan akun staf inti (Super Admin, BAA, Dosen resmi) selalu ada
   // CATATAN: Akun mahasiswa TIDAK di-inject ulang agar tidak memblokir pendaftaran mahasiswa baru
   const coreStaffRoles = ['SUPER_ADMIN', 'ADMIN', 'ADMIN_AKADEMIK', 'AKADEMIK', 'BAA', 'DOSEN'];
@@ -795,7 +809,7 @@ export async function logAudit(user, action, details) {
     localStorage.setItem(STORAGE_KEYS.LOGS, JSON.stringify(sliced));
     notifyDataChange(STORAGE_KEYS.LOGS, sliced);
 
-    if (isRealFirebaseConfigured() && db) {
+    if (isCloudSessionActive()) {
       addDoc(collection(db, "audit_logs"), {
         ...logItem,
         timestamp: serverTimestamp()
@@ -807,7 +821,7 @@ export async function logAudit(user, action, details) {
 }
 
 export async function getAuditLogs() {
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     try {
       const q = query(collection(db, "audit_logs"), orderBy("timestamp", "desc"));
       const snap = await getDocs(q);
@@ -897,7 +911,7 @@ export async function setTahunAkademikActive(taId, user) {
   }));
   await setLocal(STORAGE_KEYS.TA, updated);
   // Sync ke Firestore: update status isActive tiap dokumen TA
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     updated.forEach(item => {
       setDoc(doc(db, 'tahun_akademik', String(item.id)), item, { merge: true })
         .catch(e => console.warn('Firestore setTahunAkademikActive warning:', e));
@@ -924,7 +938,7 @@ export async function addTahunAkademik(taData, user) {
   list.unshift(newTa);
   await setLocal(STORAGE_KEYS.TA, list);
   // Sync ke Firestore
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     try {
       await setDoc(doc(db, 'tahun_akademik', String(newTa.id)), newTa, { merge: true });
       // Update status TA lainnya jika baru ini diaktifkan
@@ -971,7 +985,7 @@ export async function toggleTahunAkademikStatus(taId, user) {
 
   await setLocal(STORAGE_KEYS.TA, updated);
   // Sync ke Firestore: update status semua TA yang berubah
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     updated.forEach(item => {
       setDoc(doc(db, 'tahun_akademik', String(item.id)), { isActive: item.isActive, status: item.status }, { merge: true })
         .catch(e => console.warn('Firestore toggleTahunAkademikStatus warning:', e));
@@ -1003,7 +1017,7 @@ export async function deleteTahunAkademik(taId, user) {
   } catch (e) {}
 
   // 2. Hapus langsung dokumen di Cloud Firestore koleksi 'tahun_akademik'
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     try {
       await deleteDoc(doc(db, "tahun_akademik", String(taId)));
     } catch (e) {
@@ -1029,7 +1043,7 @@ export async function addMataKuliah(mkData, user) {
   list.push(newMk);
   await setLocal(STORAGE_KEYS.MK, list);
   // Sync ke Firestore
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     try {
       await setDoc(doc(db, 'mata_kuliah', String(newMk.id)), newMk, { merge: true });
     } catch (e) {
@@ -1050,7 +1064,7 @@ export async function updateMataKuliah(mkId, updatedData, user) {
   });
   await setLocal(STORAGE_KEYS.MK, updated);
   // Sync ke Firestore
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     try {
       await setDoc(doc(db, 'mata_kuliah', String(mkId)), updatedData, { merge: true });
     } catch (e) {
@@ -1109,7 +1123,7 @@ export async function deleteMataKuliah(mkId, user) {
   } catch (e) {}
 
   // 2. Hapus langsung dokumen di Cloud Firestore koleksi 'mata_kuliah'
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     try {
       await deleteDoc(doc(db, "mata_kuliah", String(mkId)));
     } catch (e) {
@@ -1149,14 +1163,12 @@ export async function createUser(userData, currentUser) {
   }
 
   const newUid = `user-${role.toLowerCase()}-${Date.now()}`;
-  const defaultPassword = role === 'DOSEN' ? 'dosen123' : 'stienas2026';
   const newUser = {
     uid: newUid,
     id: newUid,
     name: (userData.name || 'Pengguna Baru').trim(),
     email: targetEmail,
     username: (userData.username || targetEmail.split('@')[0] || newUid).trim(),
-    password: userData.password ? userData.password.trim() : defaultPassword,
     role: role,
     nim: role === 'MAHASISWA' ? (userData.nim ? String(userData.nim).replace(/\D/g, '') : '') : '',
     nidn: role === 'DOSEN' ? (userData.nidn ? String(userData.nidn).trim() : '') : '',
@@ -1182,7 +1194,7 @@ export async function createUser(userData, currentUser) {
   } catch (e) {}
 
   // Direct Firestore write attempt jika online
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     try {
       const cleanFbDoc = JSON.parse(JSON.stringify(newUser));
       await setDoc(doc(db, "users", newUid), cleanFbDoc, { merge: true });
@@ -1239,11 +1251,8 @@ export async function updateUser(uid, userData, currentUser) {
   if (cleanUserData.nim !== undefined) {
     cleanUserData.nim = String(cleanUserData.nim || '').replace(/\D/g, '');
   }
-  if (!cleanUserData.password || cleanUserData.password.trim() === '') {
-    delete cleanUserData.password;
-  } else {
-    cleanUserData.password = cleanUserData.password.trim();
-  }
+  // Password dikelola Firebase Authentication, bukan profil Firestore.
+  delete cleanUserData.password;
 
   // Jika akun adalah Mahasiswa, sinkronkan semester berdasarkan angkatan/NIM
   if ((target.role || '').toUpperCase() === 'MAHASISWA' || (cleanUserData.role || '').toUpperCase() === 'MAHASISWA') {
@@ -1256,7 +1265,7 @@ export async function updateUser(uid, userData, currentUser) {
   }
 
   // Update langsung ke Firestore jika online
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     try {
       await setDoc(doc(db, "users", String(uid)), cleanUserData, { merge: true });
     } catch (e) {
@@ -1288,7 +1297,7 @@ export async function updateUser(uid, userData, currentUser) {
   await logAudit(
     currentUser, 
     'UPDATE_USER', 
-    `Memperbarui profil akun: ${target.name} (${target.email})${cleanUserData.password ? ' [Termasuk Reset Kata Sandi]' : ''}`
+    `Memperbarui profil akun: ${target.name} (${target.email})`
   );
   return updated;
 }
@@ -1381,7 +1390,7 @@ export async function deleteUser(targetUserOrUid, currentUser) {
   } catch (e) {}
 
   // Direct Firestore deleteUser deleteDoc attempt untuk semua doc id terkait
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     const docIdsToDelete = new Set([
       effectiveTarget.uid,
       effectiveTarget.id,
@@ -1454,29 +1463,10 @@ export async function resetUserPassword(uid, newPassword, currentUser) {
     }
   }
 
-  const passwordToSet = (newPassword && newPassword.trim()) || 'stienas2026';
-  const updated = list.map(u => {
-    if (u.uid === uid) {
-      return { ...u, password: passwordToSet };
-    }
-    return u;
-  });
-
-  await setLocal(STORAGE_KEYS.USERS, updated);
-  // Sync password ke Firestore
-  if (isRealFirebaseConfigured() && db) {
-    try {
-      await setDoc(doc(db, 'users', String(uid)), { password: passwordToSet }, { merge: true });
-    } catch (e) {
-      console.warn('Firestore resetUserPassword warning:', e);
-    }
+  if (isCloudSessionActive()) {
+    throw new Error('Reset password dikelola Firebase Authentication. Kirim email reset melalui menu Lupa Password.');
   }
-  await logAudit(
-    currentUser, 
-    'RESET_PASSWORD', 
-    `Mereset kata sandi akun: ${target.name} (${target.email})`
-  );
-  return passwordToSet;
+  throw new Error('Reset password lokal dinonaktifkan demi keamanan.');
 }
 
 export async function registerStudent(studentData) {
@@ -1484,6 +1474,37 @@ export async function registerStudent(studentData) {
 
   if (!emailClean || !emailClean.includes('@') || !emailClean.includes('.')) {
     throw new Error("Alamat email tidak valid. Pastikan format email benar (contoh: nama@gmail.com).");
+  }
+
+  // Produksi selalu memakai Firebase Authentication. Password tidak pernah
+  // disimpan di Firestore, localStorage, atau objek profil pengguna.
+  if (isRealFirebaseConfigured() && auth) {
+    if (!studentData.password || studentData.password.trim().length < 6) {
+      throw new Error('Kata sandi minimal 6 karakter.');
+    }
+    const credential = await createUserWithEmailAndPassword(auth, emailClean, studentData.password.trim());
+    const effectiveNim = studentData.nim ? String(studentData.nim).replace(/\D/g, '') : `${String(studentData.angkatan || 2026).slice(-2)}1011${Math.floor(100 + Math.random() * 900)}`;
+    const uid = credential.user.uid;
+    const studentObj = {
+      uid,
+      id: uid,
+      name: (studentData.name || 'Mahasiswa Baru').trim(),
+      email: emailClean,
+      username: (emailClean.split('@')[0] || uid).trim().toLowerCase(),
+      role: 'MAHASISWA',
+      nim: effectiveNim,
+      nidn: '',
+      angkatan: Number(studentData.angkatan) || 2026,
+      semester: calculateAcademicStanding(effectiveNim, Number(studentData.angkatan) || 2026).semester || 1,
+      prodiId: studentData.prodiId || 'prodi-s1-manajemen',
+      phone: (studentData.phone || '').trim(),
+      isActive: true,
+      avatarUrl: `https://ui-avatars.com/api/?name=${encodeURIComponent(studentData.name || 'Mahasiswa')}&background=1e3a8a&color=fff`,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    await setDoc(doc(db, 'users', uid), studentObj, { merge: true });
+    return studentObj;
   }
 
   // 1. Ambil daftar pengguna terbaru dari database Firestore & lokal secara akurat
@@ -1542,7 +1563,6 @@ export async function registerStudent(studentData) {
     name: (studentData.name || existingUser?.name || 'Mahasiswa Baru').trim(),
     email: emailClean,
     username,
-    password: (studentData.password && studentData.password.trim()) || existingUser?.password || 'mhs2026',
     role: 'MAHASISWA',
     nim: effectiveNim,
     nidn: '',
@@ -1581,11 +1601,11 @@ export async function registerStudent(studentData) {
     list.unshift(studentObj);
   }
 
-  localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(list));
+  if (!isCloudSessionActive()) localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(list));
   notifyDataChange(STORAGE_KEYS.USERS, list);
 
   // 6. Sinkronisasi dokumen pengguna ke Firestore secara langsung
-  if (isRealFirebaseConfigured() && db && targetUid) {
+  if (isCloudSessionActive() && targetUid) {
     try {
       const cleanFbDoc = JSON.parse(JSON.stringify(studentObj));
       await setDoc(doc(db, "users", String(targetUid)), cleanFbDoc, { merge: true });
@@ -1634,7 +1654,7 @@ export async function toggleUserActive(uid, user) {
   });
   await setLocal(STORAGE_KEYS.USERS, updated);
   // Sync ke Firestore
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     try {
       await setDoc(doc(db, 'users', String(uid)), { isActive: statusChangedTo }, { merge: true });
     } catch (e) {
@@ -1764,7 +1784,7 @@ export function isClassAssignedToLecturer(cls, lecturer, mks = []) {
 }
 
 export async function syncClassMeetingsToFirestore(classItem) {
-  if (isRealFirebaseConfigured() && db && classItem) {
+  if (isCloudSessionActive() && classItem) {
     try {
       const docId = String(classItem.uid || classItem.id || '');
       if (docId) {
@@ -1828,7 +1848,7 @@ export async function createClass(classData, user) {
   await setLocal(STORAGE_KEYS.CLASSES, list);
 
   // Sync ke Firestore
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     try {
       const cleanDoc = JSON.parse(JSON.stringify(newClass));
       await setDoc(doc(db, 'kelas_kuliah', String(classId)), cleanDoc, { merge: true });
@@ -1860,7 +1880,7 @@ export async function updateClass(classId, classData, user) {
 
   await setLocal(STORAGE_KEYS.CLASSES, list);
 
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     try {
       const classDocRef = doc(db, "kelas_kuliah", String(classId));
       await setDoc(classDocRef, list[index], { merge: true });
@@ -1909,7 +1929,7 @@ export async function deleteClass(classId, user) {
   }
 
   // 2. Hapus langsung dokumen di Cloud Firestore koleksi 'kelas_kuliah' (Bukan 'classes')
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     try {
       await deleteDoc(doc(db, "kelas_kuliah", String(classId)));
     } catch (e) {
@@ -1973,7 +1993,7 @@ export async function enrollStudent(classId, mhsId, user, options = {}) {
   await setLocal(STORAGE_KEYS.CLASSES, list);
 
   // Sync perubahan pendaftaran ke Firestore
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     try {
       const docId = String(classItem.uid || classItem.id);
       await setDoc(doc(db, "kelas_kuliah", docId), {
@@ -2008,7 +2028,7 @@ export async function unenrollStudent(classId, mhsId, user) {
   await setLocal(STORAGE_KEYS.CLASSES, list);
 
   // Sync perubahan pengeluaran mahasiswa ke Firestore
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     try {
       const docId = String(classItem.uid || classItem.id);
       await setDoc(doc(db, "kelas_kuliah", docId), {
@@ -2114,7 +2134,7 @@ export async function syncStudentSemesterClasses(userOrUid, options = {}) {
   if (newlyEnrolledCount > 0) {
     await setLocal(STORAGE_KEYS.CLASSES, updatedClasses);
     // Push update ke Firestore secara langsung
-    if (isRealFirebaseConfigured() && db) {
+    if (isCloudSessionActive()) {
       for (const enc of enrolledClasses) {
         try {
           const docId = String(enc.uid || enc.id);
@@ -2227,7 +2247,7 @@ export async function syncClassesAndStudentsBySemester(user) {
   if (totalSyncCount > 0 || classChanges) {
     await setLocal(STORAGE_KEYS.CLASSES, updatedClasses);
     // Push update ke koleksi Firestore kelas_kuliah
-    if (isRealFirebaseConfigured() && db) {
+    if (isCloudSessionActive()) {
       for (const cls of updatedClasses) {
         try {
           const docId = String(cls.uid || cls.id);
@@ -2505,7 +2525,7 @@ export async function updateStudentGrade(classId, mhsId, scores, user) {
   await setLocal(STORAGE_KEYS.CLASSES, list);
 
   // Sync nilai mahasiswa ke Firestore agar sinkron di semua browser
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     try {
       const docId = String(classItem.uid || classItem.id);
       await setDoc(doc(db, "kelas_kuliah", docId), {
@@ -2716,7 +2736,7 @@ export async function getClassMessages(classId) {
   };
 
   // 1. Ambil dari Firestore (sumber utama, prioritas terendah dalam merge)
-  if (isRealFirebaseConfigured() && db) {
+  if (isCloudSessionActive()) {
     try {
       const classDocRef = doc(db, "kelas_kuliah", classId);
       const classDocSnap = await getDoc(classDocRef);
@@ -2763,34 +2783,49 @@ export async function getClassMessages(classId) {
     console.warn("Gagal mengambil pesan dari classItem:", err);
   }
 
-  // 3. Gabungkan dengan localStorage cache (PRIORITAS TERTINGGI — mencerminkan aksi terbaru user)
-  try {
-    const raw = localStorage.getItem(key);
-    if (raw) {
-      const localMsgs = JSON.parse(raw);
-      if (Array.isArray(localMsgs)) {
-        localMsgs.forEach(m => {
-          if (m && m.id) {
-            // localStorage selalu override sumber lain karena mencerminkan aksi terbaru
-            messageMap.set(m.id, mergeMessage(messageMap.get(m.id), m));
-          }
-        });
+  // Cache lokal hanya dipakai saat mode fallback. Dalam sesi cloud, cache
+  // dapat menghidupkan kembali pesan yang sudah dihapus dari perangkat lain.
+  if (!isCloudSessionActive()) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw) {
+        const localMsgs = JSON.parse(raw);
+        if (Array.isArray(localMsgs)) {
+          localMsgs.forEach(m => {
+            if (m && m.id) messageMap.set(m.id, mergeMessage(messageMap.get(m.id), m));
+          });
+        }
       }
+    } catch (lsErr) {
+      console.warn("localStorage message read error:", lsErr);
     }
-  } catch (lsErr) {
-    console.warn("localStorage message read error:", lsErr);
   }
 
   const merged = Array.from(messageMap.values());
   // Urutkan berdasarkan createdAt ASC
   merged.sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0));
 
-  // Cache kembali ke localStorage
-  try {
-    localStorage.setItem(key, JSON.stringify(merged));
-  } catch (e) {}
+  if (!isCloudSessionActive()) {
+    try { localStorage.setItem(key, JSON.stringify(merged)); } catch (e) {}
+  }
 
   return merged;
+}
+
+/** Listener realtime khusus chat pada subkoleksi Firestore. */
+export function subscribeToClassMessages(classId, callback) {
+  if (!classId || !isCloudSessionActive()) return () => {};
+  let stopped = false;
+  const unsubscribe = onSnapshot(
+    collection(db, 'kelas_kuliah', String(classId), 'pesan_diskusi'),
+    async () => {
+      if (stopped) return;
+      try { callback(await getClassMessages(classId)); }
+      catch (error) { console.warn('Gagal memperbarui chat realtime:', error); }
+    },
+    error => console.warn(`[Firestore chat] Gagal subscribe '${classId}':`, error.code || error.message)
+  );
+  return () => { stopped = true; unsubscribe(); };
 }
 
 /**
@@ -2820,38 +2855,24 @@ export async function sendClassMessage(classId, messageData, user) {
   const existing = await getClassMessages(classId);
   const updatedMessages = [...existing, newMessage];
 
-  // 2. Simpan ke classItem di STORAGE_KEYS.CLASSES
-  try {
-    const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
-    const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
-    if (classItem) {
-      classItem.messages = updatedMessages;
-      await setLocal(STORAGE_KEYS.CLASSES, list);
-    }
-  } catch (err) {
-    console.warn("Gagal mengupdate pesan ke classItem:", err);
-  }
-
-  // 3. Simpan ke key khusus localStorage
-  try {
-    localStorage.setItem(key, JSON.stringify(updatedMessages));
-  } catch (e) {}
-
-  // 4. Jika real Firebase live, simpan ke Firestore
-  if (isRealFirebaseConfigured() && db) {
+  // Sesi cloud memakai subkoleksi sebagai sumber tunggal. Ini membuat
+  // mahasiswa dapat mengirim pesan tanpa mengubah dokumen kelas induk.
+  if (isCloudSessionActive()) {
+    await addDoc(collection(db, "kelas_kuliah", String(classId), "pesan_diskusi"), {
+      ...newMessage,
+      serverTimestamp: serverTimestamp()
+    });
+  } else {
     try {
-      await updateDoc(doc(db, "kelas_kuliah", classId), {
-        messages: updatedMessages
-      }).catch(async () => {
-        await setDoc(doc(db, "kelas_kuliah", classId), { messages: updatedMessages }, { merge: true });
-      });
-
-      await addDoc(collection(db, "kelas_kuliah", classId, "pesan_diskusi"), {
-        ...newMessage,
-        serverTimestamp: new Date().toISOString()
-      }).catch(() => {});
-    } catch (e) {
-      console.warn("Firestore sendClassMessage warning:", e);
+      const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+      const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
+      if (classItem) {
+        classItem.messages = updatedMessages;
+        await setLocal(STORAGE_KEYS.CLASSES, list);
+      }
+      localStorage.setItem(key, JSON.stringify(updatedMessages));
+    } catch (err) {
+      console.warn("Gagal menyimpan pesan mode lokal:", err);
     }
   }
 
@@ -2882,27 +2903,26 @@ export async function markClassMessagesAsRead(classId, userId) {
   });
 
   if (hasChange) {
-    try {
-      localStorage.setItem(key, JSON.stringify(updatedMessages));
-    } catch (e) {}
-
-    try {
-      const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
-      const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
-      if (classItem) {
-        classItem.messages = updatedMessages;
-        await setLocal(STORAGE_KEYS.CLASSES, list);
-      }
-    } catch (err) {}
-
-    if (isRealFirebaseConfigured() && db) {
+    if (isCloudSessionActive()) {
+      const snapshots = await getDocs(collection(db, "kelas_kuliah", String(classId), "pesan_diskusi"));
+      const batch = writeBatch(db);
+      snapshots.docs.forEach(snapshot => {
+        const data = snapshot.data();
+        if (data.senderId !== userId && !(data.readBy || []).includes(userId)) {
+          batch.update(snapshot.ref, { readBy: arrayUnion(userId) });
+        }
+      });
+      await batch.commit();
+    } else {
+      try { localStorage.setItem(key, JSON.stringify(updatedMessages)); } catch (e) {}
       try {
-        await updateDoc(doc(db, "kelas_kuliah", classId), {
-          messages: updatedMessages
-        }).catch(async () => {
-          await setDoc(doc(db, "kelas_kuliah", classId), { messages: updatedMessages }, { merge: true });
-        });
-      } catch (e) {}
+        const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+        const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
+        if (classItem) {
+          classItem.messages = updatedMessages;
+          await setLocal(STORAGE_KEYS.CLASSES, list);
+        }
+      } catch (err) {}
     }
 
     notifyDataChange(key, updatedMessages);
@@ -2937,31 +2957,38 @@ export async function editClassMessage(classId, messageId, newText, user) {
     return msg;
   });
 
-  // Hapus salinan pada subkoleksi. Sebelumnya hanya array `messages` yang
-  // diperbarui, sehingga salinan subkoleksi muncul kembali saat pesan dimuat.
-  if (isRealFirebaseConfigured() && db) {
-    const messageDocs = await getDocs(collection(db, "kelas_kuliah", classId, "pesan_diskusi"));
+  if (isCloudSessionActive()) {
+    const messageDocs = await getDocs(collection(db, "kelas_kuliah", String(classId), "pesan_diskusi"));
     const matchingDocs = messageDocs.docs.filter(snapshot =>
       snapshot.id === String(messageId) || snapshot.data().id === messageId
     );
-    // Satu batch menjaga array lama dan subkoleksi tetap konsisten lintas perangkat.
-    // Jangan menelan error remote: pengguna perlu tahu bila perubahan gagal disimpan.
     const batch = writeBatch(db);
-    matchingDocs.forEach(snapshot => batch.delete(snapshot.ref));
-    batch.set(doc(db, "kelas_kuliah", classId), { messages: updatedMessages }, { merge: true });
+    if (matchingDocs.length > 0) {
+      matchingDocs.forEach(snapshot => batch.update(snapshot.ref, {
+        text: newText.trim(),
+        editedAt: updatedMessages.find(m => m.id === messageId)?.editedAt || new Date().toISOString(),
+        isEdited: true
+      }));
+    } else {
+      // Pesan legacy hanya tersimpan di array parent; update ini membutuhkan
+      // hak dosen/admin dan akan gagal dengan jelas untuk mahasiswa.
+      batch.set(doc(db, "kelas_kuliah", String(classId)), { messages: updatedMessages }, { merge: true });
+    }
     await batch.commit();
   }
 
   // Simpan cache lokal sesudah sumber remote berhasil diperbarui.
-  try { localStorage.setItem(key, JSON.stringify(updatedMessages)); } catch (e) {}
-  try {
-    const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
-    const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
-    if (classItem) {
-      classItem.messages = updatedMessages;
-      await setLocal(STORAGE_KEYS.CLASSES, list);
-    }
-  } catch (err) {}
+  if (!isCloudSessionActive()) {
+    try { localStorage.setItem(key, JSON.stringify(updatedMessages)); } catch (e) {}
+    try {
+      const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+      const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
+      if (classItem) {
+        classItem.messages = updatedMessages;
+        await setLocal(STORAGE_KEYS.CLASSES, list);
+      }
+    } catch (err) {}
+  }
 
   notifyDataChange(key, updatedMessages);
   notifyDataChange(`STIE_LMS_CLASS_MESSAGES_${classId}`, updatedMessages);
@@ -2995,25 +3022,31 @@ export async function deleteClassMessage(classId, messageId, user) {
   // Hard delete: hapus pesan dari array sepenuhnya
   const updatedMessages = existing.filter(msg => msg.id !== messageId);
 
-  // Simpan ke localStorage
-  try { localStorage.setItem(key, JSON.stringify(updatedMessages)); } catch (e) {}
-
-  // Update ke classItem
-  try {
-    const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
-    const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
-    if (classItem) {
-      classItem.messages = updatedMessages;
-      await setLocal(STORAGE_KEYS.CLASSES, list);
+  if (isCloudSessionActive()) {
+    const messageDocs = await getDocs(collection(db, "kelas_kuliah", String(classId), "pesan_diskusi"));
+    const matchingDocs = messageDocs.docs.filter(snapshot =>
+      snapshot.id === String(messageId) || snapshot.data().id === messageId
+    );
+    const batch = writeBatch(db);
+    if (matchingDocs.length > 0) {
+      // Hard delete dari subkoleksi. Error remote sengaja diteruskan agar UI
+      // tidak mengklaim berhasil ketika Firestore menolak penghapusan.
+      matchingDocs.forEach(snapshot => batch.delete(snapshot.ref));
+    } else {
+      // Dukungan data legacy yang masih berada pada array parent.
+      batch.set(doc(db, "kelas_kuliah", String(classId)), { messages: updatedMessages }, { merge: true });
     }
-  } catch (err) {}
-
-  // Update ke Firestore
-  if (isRealFirebaseConfigured() && db) {
+    await batch.commit();
+  } else {
+    try { localStorage.setItem(key, JSON.stringify(updatedMessages)); } catch (e) {}
     try {
-      await updateDoc(doc(db, "kelas_kuliah", classId), { messages: updatedMessages })
-        .catch(async () => setDoc(doc(db, "kelas_kuliah", classId), { messages: updatedMessages }, { merge: true }));
-    } catch (e) {}
+      const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+      const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
+      if (classItem) {
+        classItem.messages = updatedMessages;
+        await setLocal(STORAGE_KEYS.CLASSES, list);
+      }
+    } catch (err) {}
   }
 
   notifyDataChange(key, updatedMessages);

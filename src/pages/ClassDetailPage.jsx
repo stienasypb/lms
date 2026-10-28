@@ -15,6 +15,7 @@ import {
   getTahunAkademik,
   subscribeToDataSync,
   subscribeToFirestore,
+  subscribeToClassMessages,
   getClassMessages,
   sendClassMessage,
   markClassMessagesAsRead,
@@ -370,12 +371,6 @@ export default function ClassDetailPage({ classId, onBack, initialTab = 'MEETING
     loadClass(true);
     loadMessages();
 
-    // Polling interval untuk sinkronisasi pesan kelas secara real-time antara Dosen & Mahasiswa
-    const intervalTime = activeMainTab === 'MESSAGES' ? 3000 : 8000;
-    const pollInterval = setInterval(() => {
-      loadMessages();
-    }, intervalTime);
-
     const cleanups = [];
 
     if (isRealFirebaseConfigured()) {
@@ -393,7 +388,14 @@ export default function ClassDetailPage({ classId, onBack, initialTab = 'MEETING
           }
         }),
         subscribeToFirestore('users', () => loadClass(false)),
-        subscribeToFirestore('tahun_akademik', () => loadClass(false))
+        subscribeToFirestore('tahun_akademik', () => loadClass(false)),
+        subscribeToClassMessages(classId, (messages) => {
+          setClassMessages(messages);
+          const currentUserId = user?.uid || user?.id;
+          if (activeMainTab === 'MESSAGES' && currentUserId) {
+            markClassMessagesAsRead(classId, currentUserId);
+          }
+        })
       );
     } else {
       // Fallback lokal: hanya dalam satu browser
@@ -419,7 +421,6 @@ export default function ClassDetailPage({ classId, onBack, initialTab = 'MEETING
     }
 
     return () => {
-      clearInterval(pollInterval);
       cleanups.forEach(fn => fn && fn());
     };
   }, [classId, user, activeMainTab]);
