@@ -1,0 +1,3097 @@
+/**
+ * Layanan Firestore Terpadu (CRUD & Real-Time Sync)
+ * Mendukung mode Real Firebase BaaS dan Local Persistent Fallback/Demo
+ * Sesuai skema data NoSQL PRD Bagian 5
+ */
+import { 
+  collection, 
+  doc, 
+  getDocs, 
+  getDoc, 
+  setDoc, 
+  updateDoc, 
+  deleteDoc, 
+  addDoc, 
+  writeBatch, 
+  query, 
+  where, 
+  orderBy, 
+  serverTimestamp,
+  onSnapshot 
+} from "firebase/firestore";
+import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
+import { db, storage, isRealFirebaseConfigured } from "./config.js";
+import { 
+  INITIAL_FAKULTAS, 
+  INITIAL_PRODI, 
+  INITIAL_TA, 
+  INITIAL_USERS, 
+  INITIAL_MK, 
+  INITIAL_CLASSES, 
+  INITIAL_AUDIT_LOGS,
+  generateDefault16Meetings 
+} from "../utils/seedData.js";
+export { generateDefault16Meetings };
+import { calculateFinalGrade } from "../utils/gradeCalculator.js";
+import { calculateAcademicStanding } from "../utils/studentNimHelper.js";
+
+// Key Penyimpanan LocalStorage untuk mode Demo / Cepat
+export const STORAGE_KEYS = {
+  FAKULTAS: 'STIE_LMS_FAKULTAS',
+  PRODI: 'STIE_LMS_PRODI',
+  TA: 'STIE_LMS_TA',
+  USERS: 'STIE_LMS_USERS',
+  MK: 'STIE_LMS_MK',
+  CLASSES: 'STIE_LMS_CLASSES',
+  LOGS: 'STIE_LMS_AUDIT_LOGS'
+};
+
+export const DATA_SYNC_EVENT = 'stie_data_sync';
+
+export function notifyDataChange(key, value) {
+  if (typeof window !== 'undefined') {
+    try {
+      window.dispatchEvent(new CustomEvent(DATA_SYNC_EVENT, { detail: { key, value } }));
+    } catch (e) {
+      console.warn("Event dispatch error:", e);
+    }
+  }
+}
+export const emitDataSync = notifyDataChange;
+
+export function subscribeToDataSync(callback) {
+  if (typeof window === 'undefined') return () => {};
+  const handleCustom = (e) => callback(e.detail || {});
+  const handleStorage = (e) => callback({ key: e.key, value: e.newValue });
+
+  window.addEventListener(DATA_SYNC_EVENT, handleCustom);
+  window.addEventListener('storage', handleStorage);
+
+  return () => {
+    window.removeEventListener(DATA_SYNC_EVENT, handleCustom);
+    window.removeEventListener('storage', handleStorage);
+  };
+}
+
+/**
+ * Real-time Firestore listener untuk koleksi — bekerja LINTAS device/browser.
+ * Gunakan ini sebagai pengganti subscribeToDataSync() untuk sinkronisasi real-time.
+ * @param {string} collectionName - Nama koleksi Firestore (mis. 'kelas_kuliah', 'users')
+ * @param {function} callback - Dipanggil setiap kali data berubah, menerima array dokumen
+ * @param {object} [queryOptions] - Opsional: { orderByField, orderDir } untuk sorting
+ * @returns {function} Fungsi unsubscribe untuk cleanup
+ */
+export function subscribeToFirestore(collectionName, callback, queryOptions = {}) {
+  if (!isRealFirebaseConfigured() || !db) return () => {};
+
+  try {
+    let q;
+    if (queryOptions.orderByField) {
+      q = query(
+        collection(db, collectionName),
+        orderBy(queryOptions.orderByField, queryOptions.orderDir || 'asc')
+      );
+    } else {
+      q = collection(db, collectionName);
+    }
+
+    const unsubscribe = onSnapshot(
+      q,
+      (snapshot) => {
+        const items = snapshot.docs.map(d => {
+          const data = d.data();
+          if (!data.id && !data.uid) data.id = d.id;
+          if (data.id && !data.uid) data.uid = data.id;
+          if (data.uid && !data.id) data.id = data.uid;
+          return data;
+        });
+
+        // Simpan langsung data terbaru ke localStorage cache agar konsisten di seluruh browser/tab
+        try {
+          const keyMap = {
+            'users': STORAGE_KEYS.USERS,
+            'kelas_kuliah': STORAGE_KEYS.CLASSES,
+            'mata_kuliah': STORAGE_KEYS.MK,
+            'tahun_akademik': STORAGE_KEYS.TA,
+            'prodi': STORAGE_KEYS.PRODI,
+            'fakultas': STORAGE_KEYS.FAKULTAS
+          };
+          const storageKey = keyMap[collectionName];
+          if (storageKey && typeof localStorage !== 'undefined' && items.length > 0) {
+            localStorage.setItem(storageKey, JSON.stringify(items));
+            notifyDataChange(storageKey, items);
+          }
+        } catch (e) {}
+
+        callback(items);
+      },
+      (error) => {
+        console.warn(`[Firestore onSnapshot] Error pada koleksi '${collectionName}':`, error.code || error.message);
+      }
+    );
+    return unsubscribe;
+  } catch (e) {
+    console.warn(`[Firestore subscribeToFirestore] Gagal subscribe ke '${collectionName}':`, e);
+    return () => {};
+  }
+}
+
+/**
+ * Real-time Firestore listener untuk SATU dokumen — bekerja LINTAS device/browser.
+ * @param {string} collectionName - Nama koleksi
+ * @param {string} docId - ID dokumen
+ * @param {function} callback - Dipanggil setiap kali dokumen berubah
+ * @returns {function} Fungsi unsubscribe untuk cleanup
+ */
+export function subscribeToDocFirestore(collectionName, docId, callback) {
+  if (!isRealFirebaseConfigured() || !db || !docId) return () => {};
+
+  try {
+    const unsubscribe = onSnapshot(
+      doc(db, collectionName, String(docId)),
+      (snap) => {
+        if (snap.exists()) {
+          callback({ id: snap.id, uid: snap.id, ...snap.data() });
+        } else {
+          callback(null);
+        }
+      },
+      (error) => {
+        console.warn(`[Firestore onSnapshot doc] Error pada '${collectionName}/${docId}':`, error.code || error.message);
+      }
+    );
+    return unsubscribe;
+  } catch (e) {
+    console.warn(`[Firestore subscribeToDocFirestore] Gagal subscribe:`, e);
+    return () => {};
+  }
+}
+
+export function getCollectionName(key) {
+  switch (key) {
+    case STORAGE_KEYS.FAKULTAS: return 'fakultas';
+    case STORAGE_KEYS.PRODI: return 'prodi';
+    case STORAGE_KEYS.TA: return 'tahun_akademik';
+    case STORAGE_KEYS.USERS: return 'users';
+    case STORAGE_KEYS.MK: return 'mata_kuliah';
+    case STORAGE_KEYS.CLASSES: return 'kelas_kuliah';
+    case STORAGE_KEYS.LOGS: return 'audit_logs';
+    default: return null;
+  }
+}
+
+export function isUserDeleted(user, deletedList) {
+  if (!user || !Array.isArray(deletedList) || deletedList.length === 0) return false;
+  const uid = user.uid ? String(user.uid) : '';
+  const id = user.id ? String(user.id) : '';
+  const email = user.email ? String(user.email).toLowerCase().trim() : '';
+  const username = user.username ? String(user.username).toLowerCase().trim() : '';
+  const nim = user.nim ? String(user.nim).trim() : '';
+  const nidn = user.nidn ? String(user.nidn).trim() : '';
+
+  // Hanya akun sistem inti yang dilindungi mutlak (Super Admin & BAA resmi sistem)
+  const coreSystemEmails = [
+    'admin@stienas.ac.id',
+    'superadmin@stienas.ac.id',
+    'akademik@stienas.ac.id',
+    'adminakademik@stienas.ac.id',
+  ];
+
+  const coreSystemUids = [
+    'user-admin-1',
+    'user-admin-2',
+  ];
+
+  if (
+    (coreSystemUids.includes(uid) || coreSystemUids.includes(id)) ||
+    coreSystemEmails.includes(email) ||
+    username === 'admin' ||
+    username === 'akademik'
+  ) {
+    return false;
+  }
+
+  return (
+    (uid && deletedList.includes(uid)) ||
+    (id && deletedList.includes(id)) ||
+    (email && deletedList.includes(email)) ||
+    (username && deletedList.includes(username)) ||
+    (nim && deletedList.includes(nim)) ||
+    (nidn && deletedList.includes(nidn))
+  );
+}
+
+// Registri Konfigurasi Pertemuan (Offline-first & BaaS Sync Authoritative Store)
+export function getMeetingConfigs() {
+  try {
+    const raw = localStorage.getItem('STIE_LMS_MEETING_CONFIGS');
+    if (raw) return JSON.parse(raw);
+  } catch (e) {}
+  // Default: Pertemuan 1 kelas-akt-101-a dibuka pengumpulannya sesuai kurikulum aktif
+  return {
+    'kelas-akt-101-a_1': { isTaskOpen: true, isOpen: true }
+  };
+}
+
+export function saveMeetingConfig(classId, meetingNumber, config) {
+  try {
+    const current = getMeetingConfigs();
+    const key = `${classId}_${meetingNumber}`;
+    current[key] = {
+      ...(current[key] || {}),
+      ...config,
+      updatedAt: Date.now()
+    };
+    localStorage.setItem('STIE_LMS_MEETING_CONFIGS', JSON.stringify(current));
+  } catch (e) {}
+}
+
+export async function getLocal(key, initial = []) {
+  let localItems = null;
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const raw = localStorage.getItem(key);
+      if (raw) {
+        localItems = JSON.parse(raw);
+      }
+    }
+  } catch (e) {
+    console.warn("Storage read error:", e);
+  }
+
+  let fbLoaded = false;
+  if (isRealFirebaseConfigured() && db) {
+    const colName = getCollectionName(key);
+    if (colName) {
+      try {
+        const snap = await getDocs(collection(db, colName));
+        if (!snap.empty) {
+          let remoteItems = snap.docs.map(d => {
+            const data = d.data();
+            if (!data.uid && !data.id) {
+               data.id = d.id;
+            }
+            if (data.id && !data.uid) {
+               data.uid = data.id;
+            }
+            if (data.uid && !data.id) {
+               data.id = data.uid;
+            }
+            return data;
+          });
+
+          let deletedIds = [];
+          if (key === STORAGE_KEYS.USERS) {
+            try {
+              const delRaw = localStorage.getItem('STIE_LMS_DELETED_USERS');
+              if (delRaw) deletedIds = JSON.parse(delRaw);
+            } catch(e) {}
+            // Pastikan akun yang telah dihapus permanen masuk ke filter
+            const permanentDeleted = [
+              'user-mhs-1789716217109', 
+              'user-mhs-1789715558398',
+              'user-mhs-1',
+              'user-mhs-2',
+              'user-mhs-3',
+              'user-mahasiswa-1789742014560'
+            ];
+            permanentDeleted.forEach(pid => {
+              if (!deletedIds.includes(pid)) deletedIds.push(pid);
+            });
+            // Jangan pernah memfilter akun resmi Rabiyah yang dipulihkan
+            deletedIds = deletedIds.filter(id => id !== 'user-mhs-1789806444944' && id !== 'raby79279@gmail.com');
+            // Filter remoteItems terlebih dahulu sebelum digabungkan
+            remoteItems = remoteItems.filter(item => !isUserDeleted(item, deletedIds));
+          } else if (key === STORAGE_KEYS.CLASSES) {
+            try {
+              const delRaw = localStorage.getItem('STIE_LMS_DELETED_CLASSES');
+              if (delRaw) deletedIds = JSON.parse(delRaw);
+            } catch(e) {}
+          } else if (key === STORAGE_KEYS.TA) {
+            try {
+              const delRaw = localStorage.getItem('STIE_LMS_DELETED_TA');
+              if (delRaw) deletedIds = JSON.parse(delRaw);
+            } catch(e) {}
+          } else if (key === STORAGE_KEYS.MK) {
+            try {
+              const delRaw = localStorage.getItem('STIE_LMS_DELETED_MK');
+              if (delRaw) deletedIds = JSON.parse(delRaw);
+            } catch(e) {}
+          }
+
+          // Gabungkan remoteItems dan localItems (Firestore selalu otoritatif / data terbaru dari cloud)
+          let finalItems = remoteItems;
+          if (Array.isArray(localItems) && localItems.length > 0) {
+            const itemMap = new Map();
+            // Masukkan data lokal terlebih dahulu sebagai fallback
+            localItems.forEach(item => {
+              const id = item.uid || item.id || item.email || item.kodeMk || item.kodeTa;
+              if (id) itemMap.set(String(id), item);
+            });
+            // Update dengan data dari Firestore (FIRESTORE SELALU MENANG / OTORITATIF)
+            remoteItems.forEach(item => {
+              const id = item.uid || item.id || item.email || item.kodeMk || item.kodeTa;
+              if (id) {
+                if (key === STORAGE_KEYS.USERS && isUserDeleted(item, deletedIds)) {
+                  return;
+                }
+                const existing = itemMap.get(String(id));
+                if (existing) {
+                  let mergedMeetings = item.meetings || existing.meetings;
+                  // Remote (item) berada setelah local (existing) agar perubahan cloud selalu aktif di semua device
+                  itemMap.set(String(id), { ...existing, ...item, meetings: mergedMeetings });
+                } else {
+                  itemMap.set(String(id), item);
+                }
+              }
+            });
+            // Pastikan item yang sudah tidak ada di Firestore dihapus dari cache (kecuali akun admin inti)
+            finalItems = Array.from(itemMap.values()).filter(item => {
+              const id = item.uid || item.id || item.email || item.kodeMk || item.kodeTa;
+              const existsInRemote = remoteItems.some(r => (r.uid || r.id || r.email || r.kodeMk || r.kodeTa) === id);
+              if (key === STORAGE_KEYS.USERS) {
+                if (item.role === 'SUPER_ADMIN' || item.role === 'ADMIN_AKADEMIK') return true;
+                return existsInRemote && !isUserDeleted(item, deletedIds);
+              }
+              return existsInRemote;
+            });
+          }
+
+          // Integrasikan konfigurasi pertemuan (meetingConfigs) secara otoritatif pada kelas perkuliahan
+          if (key === STORAGE_KEYS.CLASSES) {
+            const meetingConfigs = getMeetingConfigs();
+            finalItems = finalItems.map(cls => {
+              const clsId = String(cls.uid || cls.id || '');
+              let rawMeetings = Array.isArray(cls.meetings) && cls.meetings.length > 0 
+                ? cls.meetings 
+                : generateDefault16Meetings(cls.namaMk || 'Mata Kuliah');
+
+              // Pastikan seluruh 16 pertemuan lengkap
+              if (rawMeetings.length < 16) {
+                const defaults = generateDefault16Meetings(cls.namaMk || 'Mata Kuliah');
+                rawMeetings = defaults.map(defM => {
+                  const existingM = rawMeetings.find(rm => Number(rm.pertemuanKe) === Number(defM.pertemuanKe));
+                  return { ...defM, ...(existingM || {}) };
+                });
+              }
+
+              return {
+                ...cls,
+                namaTa: cls.namaTa || '2026/2027 Ganjil',
+                tahunAkademikId: cls.tahunAkademikId || 'ta-20261',
+                status: cls.status || 'OPEN',
+                enrolledStudents: Array.isArray(cls.enrolledStudents) ? cls.enrolledStudents : [],
+                meetings: rawMeetings.map(m => {
+                  const mNum = Number(m.pertemuanKe);
+                  const cfg = meetingConfigs[`${clsId}_${mNum}`] || meetingConfigs[`${cls.id}_${mNum}`] || {};
+                  
+                  // Default task status: terbuka kecuali secara eksplisit ditutup oleh dosen
+                  let isTaskOpen = m.isTaskOpen !== undefined ? Boolean(m.isTaskOpen) : true;
+                  if (cfg.isTaskOpen !== undefined) {
+                    isTaskOpen = Boolean(cfg.isTaskOpen);
+                  }
+
+                  let isOpen = m.isOpen !== undefined ? Boolean(m.isOpen) : true;
+                  if (cfg.isOpen !== undefined) {
+                    isOpen = Boolean(cfg.isOpen);
+                  }
+
+                  return {
+                    ...m,
+                    ...cfg,
+                    isTaskOpen,
+                    isOpen
+                  };
+                })
+              };
+            });
+          }
+
+          if (deletedIds.length > 0) {
+            if (key === STORAGE_KEYS.USERS) {
+              finalItems = finalItems.filter(item => !isUserDeleted(item, deletedIds));
+            } else {
+              finalItems = finalItems.filter(item => {
+                const id = String(item.uid || item.id || '');
+                return !deletedIds.includes(id);
+              });
+            }
+          }
+
+          if (typeof localStorage !== 'undefined') {
+            localStorage.setItem(key, JSON.stringify(finalItems));
+          }
+          fbLoaded = true;
+          return finalItems;
+        }
+      } catch(e) {
+        console.warn("Firestore getLocal error:", e);
+      }
+    }
+  }
+
+  // Ambil daftar ID yang dihapus untuk fallback local
+  let localDeletedIds = [];
+  if (key === STORAGE_KEYS.USERS) {
+    try {
+      const delRaw = localStorage.getItem('STIE_LMS_DELETED_USERS');
+      if (delRaw) localDeletedIds = JSON.parse(delRaw);
+    } catch(e) {}
+    const permanentDeleted = [
+      'user-mhs-1789716217109', 
+      'user-mhs-1789715558398',
+      'user-mhs-1',
+      'user-mhs-2',
+      'user-mhs-3',
+      'user-mahasiswa-1789742014560'
+    ];
+    permanentDeleted.forEach(pid => {
+      if (!localDeletedIds.includes(pid)) localDeletedIds.push(pid);
+    });
+    // Jangan pernah memfilter akun resmi Rabiyah yang dipulihkan
+    localDeletedIds = localDeletedIds.filter(id => id !== 'user-mhs-1789806444944' && id !== 'raby79279@gmail.com');
+  } else if (key === STORAGE_KEYS.CLASSES) {
+    try {
+      const delRaw = localStorage.getItem('STIE_LMS_DELETED_CLASSES');
+      if (delRaw) localDeletedIds = JSON.parse(delRaw);
+    } catch(e) {}
+  } else if (key === STORAGE_KEYS.TA) {
+    try {
+      const delRaw = localStorage.getItem('STIE_LMS_DELETED_TA');
+      if (delRaw) localDeletedIds = JSON.parse(delRaw);
+    } catch(e) {}
+  } else if (key === STORAGE_KEYS.MK) {
+    try {
+      const delRaw = localStorage.getItem('STIE_LMS_DELETED_MK');
+      if (delRaw) localDeletedIds = JSON.parse(delRaw);
+    } catch(e) {}
+  }
+
+  if (Array.isArray(localItems) && localItems.length > 0) {
+    if (localDeletedIds.length > 0) {
+      if (key === STORAGE_KEYS.USERS) {
+        localItems = localItems.filter(item => !isUserDeleted(item, localDeletedIds));
+      } else {
+        localItems = localItems.filter(item => !localDeletedIds.includes(String(item.id || item.uid || '')));
+      }
+    }
+    if (key === STORAGE_KEYS.CLASSES) {
+      const meetingConfigs = getMeetingConfigs();
+      localItems = localItems.map(cls => {
+        const clsId = String(cls.uid || cls.id || '');
+        let rawMeetings = Array.isArray(cls.meetings) && cls.meetings.length > 0 
+          ? cls.meetings 
+          : generateDefault16Meetings(cls.namaMk || 'Mata Kuliah');
+
+        if (rawMeetings.length < 16) {
+          const defaults = generateDefault16Meetings(cls.namaMk || 'Mata Kuliah');
+          rawMeetings = defaults.map(defM => {
+            const existingM = rawMeetings.find(rm => Number(rm.pertemuanKe) === Number(defM.pertemuanKe));
+            return { ...defM, ...(existingM || {}) };
+          });
+        }
+
+        return {
+          ...cls,
+          namaTa: cls.namaTa || '2026/2027 Ganjil',
+          tahunAkademikId: cls.tahunAkademikId || 'ta-20261',
+          status: cls.status || 'OPEN',
+          enrolledStudents: Array.isArray(cls.enrolledStudents) ? cls.enrolledStudents : [],
+          meetings: rawMeetings.map(m => {
+            const mNum = Number(m.pertemuanKe);
+            const cfg = meetingConfigs[`${clsId}_${mNum}`] || meetingConfigs[`${cls.id}_${mNum}`] || {};
+            let isTaskOpen = m.isTaskOpen !== undefined ? Boolean(m.isTaskOpen) : true;
+            if (cfg.isTaskOpen !== undefined) {
+              isTaskOpen = Boolean(cfg.isTaskOpen);
+            }
+            let isOpen = m.isOpen !== undefined ? Boolean(m.isOpen) : true;
+            if (cfg.isOpen !== undefined) {
+              isOpen = Boolean(cfg.isOpen);
+            }
+            return {
+              ...m,
+              ...cfg,
+              isTaskOpen,
+              isOpen
+            };
+          })
+        };
+      });
+    }
+    return localItems;
+  }
+  const cleanInitial = (localDeletedIds.length > 0 && Array.isArray(initial))
+    ? (key === STORAGE_KEYS.USERS 
+        ? initial.filter(item => !isUserDeleted(item, localDeletedIds)) 
+        : initial.filter(item => !localDeletedIds.includes(String(item.id || item.uid || ''))))
+    : initial;
+  await setLocal(key, cleanInitial);
+  return cleanInitial;
+}
+
+export async function setLocal(key, value) {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(key, JSON.stringify(value));
+    }
+    notifyDataChange(key, value);
+  } catch (e) {
+    console.warn("Storage write error:", e);
+  }
+}
+
+// Inisialisasi awal localStorage (khusus lingkungan browser)
+export async function initializeLocalStore() {
+  if (typeof window === 'undefined' || typeof localStorage === 'undefined') return;
+  await getLocal(STORAGE_KEYS.FAKULTAS, INITIAL_FAKULTAS);
+  await getLocal(STORAGE_KEYS.PRODI, INITIAL_PRODI);
+  
+  // Pastikan Semester / TA yang dihapus tidak dibangkitkan
+  let deletedTaIds = [];
+  try {
+    const delRaw = localStorage.getItem('STIE_LMS_DELETED_TA');
+    if (delRaw) deletedTaIds = JSON.parse(delRaw);
+  } catch(e) {}
+  const existingTa = await getLocal(STORAGE_KEYS.TA, INITIAL_TA);
+  const cleanTa = existingTa.filter(t => !deletedTaIds.includes(String(t.id)));
+  if (cleanTa.length !== existingTa.length) {
+    await setLocal(STORAGE_KEYS.TA, cleanTa);
+  }
+
+  // 1. Bersihkan seluruh akun master resmi institusi dari blacklist jika pernah tercatat
+  const officialProtectedUids = [
+    'user-admin-1',
+    'user-admin-2',
+    'user-dosen-1',
+    'user-dosen-1789698585944',
+    'user-dosen-1789742932417',
+    'user-dosen-1789782310180',
+    'user-dosen-2',
+    'user-mhs-1789798197871',
+    'user-mhs-1789800818486',
+    'user-mhs-1789801049377',
+    'user-mhs-1789801227932',
+    'user-mhs-1789806444944',
+    'user-mhs-1789909513563'
+  ];
+  const officialProtectedEmails = [
+    'admin@stienas.ac.id',
+    'superadmin@stienas.ac.id',
+    'akademik@stienas.ac.id',
+    'adminakademik@stienas.ac.id',
+    'mohdaribjm@gmail.com',
+    'arief@stienas-ypb.ac.id',
+    'waket1@stienas-ypb.ac.id',
+    'mailiana.01@gmail.com',
+    'rakhmiridhawati51@gmail.com',
+    'nadiayuni16@gmail.com',
+    'dellapuspita2436@gmail.com',
+    'muhammadarifzairullah@gmail.com',
+    'ayung006@gmail.com',
+    'raby79279@gmail.com',
+    'siti@gmail.com'
+  ];
+  const officialProtectedNims = [
+    '251011152',
+    '20251111631',
+    '20251111611',
+    '20251111600',
+    '20251111644',
+    '262011547'
+  ];
+
+  try {
+    const delUsersRaw = localStorage.getItem('STIE_LMS_DELETED_USERS');
+    if (delUsersRaw) {
+      const parsed = JSON.parse(delUsersRaw);
+      const filtered = parsed.filter(id => {
+        const idStr = String(id).toLowerCase().trim();
+        return !officialProtectedUids.includes(id) && 
+               !officialProtectedEmails.includes(idStr) && 
+               !officialProtectedNims.includes(idStr) &&
+               idStr !== 'admin' && 
+               idStr !== 'akademik';
+      });
+      localStorage.setItem('STIE_LMS_DELETED_USERS', JSON.stringify(filtered));
+    }
+  } catch (e) {}
+
+  // 2. Bersihkan kelas perkuliahan institusi resmi dari blacklist agar selalu dipulihkan
+  const officialProtectedClassIds = INITIAL_CLASSES.map(c => String(c.id));
+  try {
+    const delClassesRaw = localStorage.getItem('STIE_LMS_DELETED_CLASSES');
+    if (delClassesRaw) {
+      const parsed = JSON.parse(delClassesRaw);
+      const filtered = parsed.filter(id => !officialProtectedClassIds.includes(String(id)));
+      localStorage.setItem('STIE_LMS_DELETED_CLASSES', JSON.stringify(filtered));
+    }
+  } catch (e) {}
+
+  // 3. Bersihkan mata kuliah resmi institusi dari blacklist agar selalu dipulihkan
+  const officialProtectedMkIds = INITIAL_MK.map(m => String(m.id));
+  try {
+    const delMkRaw = localStorage.getItem('STIE_LMS_DELETED_MK');
+    if (delMkRaw) {
+      const parsed = JSON.parse(delMkRaw);
+      const filtered = parsed.filter(id => !officialProtectedMkIds.includes(String(id)));
+      localStorage.setItem('STIE_LMS_DELETED_MK', JSON.stringify(filtered));
+    }
+  } catch (e) {}
+
+  const currentUsers = await getLocal(STORAGE_KEYS.USERS, INITIAL_USERS);
+  // Hapus akun dummy/sampel lama (bukan akun riil)
+  const dummyUids = ['user-mhs-4', 'user-mhs-1', 'user-mhs-2', 'user-mhs-3', 'user-mahasiswa-1789742014560'];
+  let sanitizedUsers = currentUsers.filter(u => {
+    const uid = String(u.uid || u.id || '');
+    return !dummyUids.includes(uid) && u.email !== 'mahasiswa@stienas.ac.id';
+  });
+
+  let usersChanged = sanitizedUsers.length !== currentUsers.length;
+  // Pastikan akun staf inti (Super Admin, BAA, Dosen resmi) selalu ada
+  // CATATAN: Akun mahasiswa TIDAK di-inject ulang agar tidak memblokir pendaftaran mahasiswa baru
+  const coreStaffRoles = ['SUPER_ADMIN', 'ADMIN', 'ADMIN_AKADEMIK', 'AKADEMIK', 'BAA', 'DOSEN'];
+  INITIAL_USERS.filter(u => coreStaffRoles.includes((u.role || '').toUpperCase())).forEach(coreUser => {
+    const exists = sanitizedUsers.some(u => 
+      (u.uid && (u.uid === coreUser.uid || u.id === coreUser.uid)) ||
+      (u.email && u.email.toLowerCase().trim() === coreUser.email.toLowerCase().trim()) ||
+      (coreUser.username && u.username && u.username.toLowerCase().trim() === coreUser.username.toLowerCase().trim())
+    );
+    if (!exists) {
+      sanitizedUsers.push({ ...coreUser });
+      usersChanged = true;
+    }
+  });
+
+  // Sinkronisasi otomatis field semester untuk seluruh akun mahasiswa (misal: Angkatan 2025 -> Semester 3, Angkatan 2026 -> Semester 1)
+  sanitizedUsers.forEach(u => {
+    if ((u.role || '').toUpperCase() === 'MAHASISWA') {
+      const standing = calculateAcademicStanding(u.nim, u.angkatan);
+      if (standing && standing.semester && Number(u.semester) !== standing.semester) {
+        u.semester = standing.semester;
+        usersChanged = true;
+      }
+    }
+  });
+
+  if (usersChanged) {
+    await setLocal(STORAGE_KEYS.USERS, sanitizedUsers);
+  }
+
+  // Pastikan Mata Kuliah yang baru disertakan dan yang dihapus tidak dibangkitkan
+  let deletedMkIds = [];
+  try {
+    const delRaw = localStorage.getItem('STIE_LMS_DELETED_MK');
+    if (delRaw) deletedMkIds = JSON.parse(delRaw);
+  } catch(e) {}
+  const existingMks = await getLocal(STORAGE_KEYS.MK, INITIAL_MK);
+  const missingMks = INITIAL_MK.filter(imk =>
+    !existingMks.some(emk => String(emk.id) === String(imk.id) || emk.kodeMk === imk.kodeMk) &&
+    !deletedMkIds.includes(String(imk.id))
+  );
+  const combinedMks = (missingMks.length > 0 ? [...existingMks, ...missingMks] : existingMks)
+    .filter(m => !deletedMkIds.includes(String(m.id)));
+  await setLocal(STORAGE_KEYS.MK, combinedMks);
+  
+  // Bersihkan materi dummy lama yang memiliki raw.githubusercontent.com dan sertakan kelas baru jika ada
+  let deletedClassIds = [];
+  try {
+    const delRaw = localStorage.getItem('STIE_LMS_DELETED_CLASSES');
+    if (delRaw) deletedClassIds = JSON.parse(delRaw);
+  } catch(e) {}
+
+  const existingClasses = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+  const missingInitial = INITIAL_CLASSES.filter(ic => 
+    !existingClasses.some(ec => String(ec.id) === String(ic.id)) &&
+    !deletedClassIds.includes(String(ic.id))
+  );
+  const combinedClasses = missingInitial.length > 0 ? [...existingClasses, ...missingInitial] : existingClasses;
+
+  // Bersihkan key override legacy dari localStorage agar tidak mengaburkan state terkini
+  try {
+    const keysToRemove = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith('STIE_LMS_MEETING_')) {
+        keysToRemove.push(k);
+      }
+    }
+    keysToRemove.forEach(k => localStorage.removeItem(k));
+  } catch (e) {}
+
+  const meetingConfigs = getMeetingConfigs();
+  const cleanedClasses = combinedClasses
+    .filter(cls => !deletedClassIds.includes(String(cls.id)))
+    .map(cls => {
+      const clsId = String(cls.uid || cls.id || '');
+      const mk = combinedMks.find(m => String(m.id) === String(cls.mataKuliahId) || m.kodeMk === cls.kodeMk);
+      const courseSemester = Number(cls.semester || mk?.semesterDefault || 1);
+      return {
+        ...cls,
+        semester: courseSemester,
+        tahunAkademikId: cls.tahunAkademikId || 'ta-20261',
+        namaTa: cls.namaTa || '2026/2027 Ganjil',
+        meetings: (cls.meetings || []).map(m => {
+          const mNum = Number(m.pertemuanKe);
+          const cfg = meetingConfigs[`${clsId}_${mNum}`] || meetingConfigs[`${cls.id}_${mNum}`] || {};
+          let isTaskOpen = m.isTaskOpen !== undefined ? Boolean(m.isTaskOpen) : true;
+          if (clsId === 'kelas-akt-101-a' && mNum === 1 && cfg.isTaskOpen === undefined) {
+            isTaskOpen = true;
+          }
+          if (cfg.isTaskOpen !== undefined) {
+            isTaskOpen = Boolean(cfg.isTaskOpen);
+          }
+          let isOpen = m.isOpen !== undefined ? Boolean(m.isOpen) : true;
+          if (cfg.isOpen !== undefined) {
+            isOpen = Boolean(cfg.isOpen);
+          }
+          return {
+            ...m,
+            ...cfg,
+            isTaskOpen,
+            isOpen,
+            hasTask: m.hasTask !== undefined ? Boolean(m.hasTask) : (mNum % 2 !== 0 && !m.isExam),
+            materials: (m.materials || []).filter(mat => 
+              !mat.judul?.includes('Slide Materi Pertemuan 2') &&
+              !(mat.fileUrl || '').includes('raw.githubusercontent.com')
+            )
+          };
+        })
+      };
+    });
+  await setLocal(STORAGE_KEYS.CLASSES, cleanedClasses);
+
+  // Otomatis sinkronkan data kelas mahasiswa sesuai semester berjalan
+  try {
+    await syncClassesAndStudentsBySemester();
+  } catch (e) {
+    console.warn("Auto sync classes by semester on init error:", e);
+  }
+
+  await getLocal(STORAGE_KEYS.LOGS, INITIAL_AUDIT_LOGS);
+}
+if (typeof window !== 'undefined') {
+  initializeLocalStore().catch(console.error);
+}
+
+/* =========================================================================
+   1. AUDIT LOGS (FR-08.2)
+   ========================================================================= */
+export async function logAudit(user, action, details) {
+  const logItem = {
+    id: `log-${Date.now()}`,
+    userId: user?.uid || user?.id || 'anonymous',
+    userName: user?.name || user?.email || 'System',
+    role: user?.role || 'UNKNOWN',
+    action,
+    details,
+    timestamp: new Date().toISOString()
+  };
+
+  try {
+    const raw = localStorage.getItem(STORAGE_KEYS.LOGS);
+    const logs = raw ? JSON.parse(raw) : [...INITIAL_AUDIT_LOGS];
+    logs.unshift(logItem);
+    const sliced = logs.slice(0, 200);
+    localStorage.setItem(STORAGE_KEYS.LOGS, JSON.stringify(sliced));
+    notifyDataChange(STORAGE_KEYS.LOGS, sliced);
+
+    if (isRealFirebaseConfigured() && db) {
+      addDoc(collection(db, "audit_logs"), {
+        ...logItem,
+        timestamp: serverTimestamp()
+      }).catch(e => console.warn("Audit log to Firestore background warning:", e));
+    }
+  } catch (e) {
+    console.warn("logAudit warning:", e);
+  }
+}
+
+export async function getAuditLogs() {
+  if (isRealFirebaseConfigured() && db) {
+    try {
+      const q = query(collection(db, "audit_logs"), orderBy("timestamp", "desc"));
+      const snap = await getDocs(q);
+      return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    } catch (e) {
+      console.warn("Firestore audit logs read failed, fallback to local:", e);
+    }
+  }
+  return await getLocal(STORAGE_KEYS.LOGS, INITIAL_AUDIT_LOGS);
+}
+
+/* =========================================================================
+   2. MASTER DATA (FR-02)
+   ========================================================================= */
+export async function getFakultas() {
+  return await getLocal(STORAGE_KEYS.FAKULTAS, INITIAL_FAKULTAS);
+}
+
+export async function getProdi() {
+  const list = await getLocal(STORAGE_KEYS.PRODI, INITIAL_PRODI);
+  let hasCorrection = false;
+  const corrected = list.map(item => {
+    const isAkt = item.id === 'prodi-s1-akuntansi' || item.namaProdi?.toLowerCase().includes('akuntansi') || item.kodeProdi === '62201';
+    const isMnj = item.id === 'prodi-s1-manajemen' || item.namaProdi?.toLowerCase().includes('manajemen') || item.kodeProdi === '61201';
+
+    let namaKaprodi = item.namaKaprodi;
+    let nuptkKaprodi = item.nuptkKaprodi || item.nidnKaprodi;
+
+    if (isAkt) {
+      if (!namaKaprodi || namaKaprodi.includes('Ramli') || namaKaprodi.includes('Fadhilah')) {
+        namaKaprodi = 'Ruslidan Agustina, SE., MSA.';
+        hasCorrection = true;
+      }
+      if (!nuptkKaprodi) {
+        nuptkKaprodi = '1124018201';
+        hasCorrection = true;
+      }
+    } else if (isMnj) {
+      if (!namaKaprodi || namaKaprodi.includes('Ramli') || namaKaprodi.includes('Fadhilah')) {
+        namaKaprodi = 'Rizki Amalia Afriana, SE., MM.';
+        hasCorrection = true;
+      }
+      if (!nuptkKaprodi) {
+        nuptkKaprodi = '1102046801';
+        hasCorrection = true;
+      }
+    }
+
+    return {
+      ...item,
+      namaKaprodi: namaKaprodi || (isAkt ? 'Ruslidan Agustina, SE., MSA.' : 'Rizki Amalia Afriana, SE., MM.'),
+      nuptkKaprodi: nuptkKaprodi || (isAkt ? '1124018201' : '1102046801')
+    };
+  });
+
+  if (hasCorrection) {
+    await setLocal(STORAGE_KEYS.PRODI, corrected);
+  }
+
+  return corrected;
+}
+
+export async function updateProdi(prodiId, updateData, user) {
+  const list = await getProdi();
+  const updated = list.map(item => {
+    if (item.id === prodiId) {
+      return { ...item, ...updateData };
+    }
+    return item;
+  });
+  await setLocal(STORAGE_KEYS.PRODI, updated);
+  if (user) {
+    await logAudit(user, 'UPDATE_PRODI', `Mengubah data Kaprodi / Program Studi ID: ${prodiId} (${updateData.namaKaprodi || ''})`);
+  }
+  return updated;
+}
+
+export async function getTahunAkademik() {
+  return await getLocal(STORAGE_KEYS.TA, INITIAL_TA);
+}
+
+export async function setTahunAkademikActive(taId, user) {
+  const list = await getLocal(STORAGE_KEYS.TA, INITIAL_TA);
+  const updated = list.map(item => ({
+    ...item,
+    isActive: item.id === taId
+  }));
+  await setLocal(STORAGE_KEYS.TA, updated);
+  // Sync ke Firestore: update status isActive tiap dokumen TA
+  if (isRealFirebaseConfigured() && db) {
+    updated.forEach(item => {
+      setDoc(doc(db, 'tahun_akademik', String(item.id)), item, { merge: true })
+        .catch(e => console.warn('Firestore setTahunAkademikActive warning:', e));
+    });
+  }
+  await logAudit(user, 'UPDATE_TA', `Mengaktifkan Tahun Akademik ID: ${taId}`);
+  return updated;
+}
+
+export async function addTahunAkademik(taData, user) {
+  const list = await getLocal(STORAGE_KEYS.TA, INITIAL_TA);
+  const newTa = {
+    ...taData,
+    id: taData.id || `ta-${Date.now()}`,
+    isActive: taData.isActive || false,
+    status: taData.isActive ? 'DIBUKA' : 'DITUTUP'
+  };
+  if (newTa.isActive) {
+    list.forEach(t => {
+      t.isActive = false;
+      t.status = 'DITUTUP';
+    });
+  }
+  list.unshift(newTa);
+  await setLocal(STORAGE_KEYS.TA, list);
+  // Sync ke Firestore
+  if (isRealFirebaseConfigured() && db) {
+    try {
+      await setDoc(doc(db, 'tahun_akademik', String(newTa.id)), newTa, { merge: true });
+      // Update status TA lainnya jika baru ini diaktifkan
+      if (newTa.isActive) {
+        list.forEach(t => {
+          if (t.id !== newTa.id) {
+            setDoc(doc(db, 'tahun_akademik', String(t.id)), { isActive: false, status: 'DITUTUP' }, { merge: true })
+              .catch(e => console.warn('Firestore addTahunAkademik deactivate warning:', e));
+          }
+        });
+      }
+    } catch (e) {
+      console.warn('Firestore addTahunAkademik warning:', e);
+    }
+  }
+  await logAudit(user, 'CREATE_TA', `Membuka/Menambahkan Semester Baru: ${newTa.namaTa} (${newTa.kodeTa})`);
+  return list;
+}
+
+export async function toggleTahunAkademikStatus(taId, user) {
+  const list = await getLocal(STORAGE_KEYS.TA, INITIAL_TA);
+  let targetTa = list.find(t => t.id === taId);
+  if (!targetTa) return list;
+
+  const willBeActive = !targetTa.isActive;
+  const updated = list.map(item => {
+    if (item.id === taId) {
+      return {
+        ...item,
+        isActive: willBeActive,
+        status: willBeActive ? 'DIBUKA' : 'DITUTUP'
+      };
+    }
+    // Jika semester taId dibuka/diaktifkan, semester lainnya dinonaktifkan (ditutup)
+    if (willBeActive) {
+      return {
+        ...item,
+        isActive: false,
+        status: 'DITUTUP'
+      };
+    }
+    return item;
+  });
+
+  await setLocal(STORAGE_KEYS.TA, updated);
+  // Sync ke Firestore: update status semua TA yang berubah
+  if (isRealFirebaseConfigured() && db) {
+    updated.forEach(item => {
+      setDoc(doc(db, 'tahun_akademik', String(item.id)), { isActive: item.isActive, status: item.status }, { merge: true })
+        .catch(e => console.warn('Firestore toggleTahunAkademikStatus warning:', e));
+    });
+  }
+  await logAudit(
+    user, 
+    willBeActive ? 'BUKA_SEMESTER' : 'TUTUP_SEMESTER', 
+    `${willBeActive ? 'Membuka' : 'Menutup'} Semester / Tahun Akademik: ${targetTa.namaTa} (${targetTa.kodeTa})`
+  );
+  return updated;
+}
+
+export async function deleteTahunAkademik(taId, user) {
+  if (!taId) throw new Error("ID Semester tidak valid");
+  const list = await getLocal(STORAGE_KEYS.TA, INITIAL_TA);
+  const target = list.find(t => String(t.id) === String(taId));
+  const updated = list.filter(t => String(t.id) !== String(taId));
+
+  // 1. Catat ke STIE_LMS_DELETED_TA agar tidak ter-resurrect
+  try {
+    const delRaw = localStorage.getItem('STIE_LMS_DELETED_TA') || '[]';
+    const delList = JSON.parse(delRaw);
+    const targetIdStr = String(taId);
+    if (!delList.includes(targetIdStr)) {
+      delList.push(targetIdStr);
+      localStorage.setItem('STIE_LMS_DELETED_TA', JSON.stringify(delList));
+    }
+  } catch (e) {}
+
+  // 2. Hapus langsung dokumen di Cloud Firestore koleksi 'tahun_akademik'
+  if (isRealFirebaseConfigured() && db) {
+    try {
+      await deleteDoc(doc(db, "tahun_akademik", String(taId)));
+    } catch (e) {
+      console.warn("Direct Firestore deleteTahunAkademik warning:", e);
+    }
+  }
+
+  await setLocal(STORAGE_KEYS.TA, updated);
+  await logAudit(user, 'DELETE_TA', `Menghapus Semester: ${target?.namaTa || taId}`);
+  return updated;
+}
+
+export async function getMataKuliah() {
+  return await getLocal(STORAGE_KEYS.MK, INITIAL_MK);
+}
+
+export async function addMataKuliah(mkData, user) {
+  const list = await getLocal(STORAGE_KEYS.MK, INITIAL_MK);
+  const newMk = {
+    ...mkData,
+    id: `mk-${Date.now()}`
+  };
+  list.push(newMk);
+  await setLocal(STORAGE_KEYS.MK, list);
+  // Sync ke Firestore
+  if (isRealFirebaseConfigured() && db) {
+    try {
+      await setDoc(doc(db, 'mata_kuliah', String(newMk.id)), newMk, { merge: true });
+    } catch (e) {
+      console.warn('Firestore addMataKuliah warning:', e);
+    }
+  }
+  await logAudit(user, 'CREATE_MK', `Menambahkan Mata Kuliah ${newMk.kodeMk} - ${newMk.namaMk}`);
+  return newMk;
+}
+
+export async function updateMataKuliah(mkId, updatedData, user) {
+  const list = await getLocal(STORAGE_KEYS.MK, INITIAL_MK);
+  const updated = list.map(item => {
+    if (item.id === mkId) {
+      return { ...item, ...updatedData };
+    }
+    return item;
+  });
+  await setLocal(STORAGE_KEYS.MK, updated);
+  // Sync ke Firestore
+  if (isRealFirebaseConfigured() && db) {
+    try {
+      await setDoc(doc(db, 'mata_kuliah', String(mkId)), updatedData, { merge: true });
+    } catch (e) {
+      console.warn('Firestore updateMataKuliah warning:', e);
+    }
+  }
+
+  // Jika BAA memperbarui penugasan Dosen pada Mata Kuliah, sinkronkan ke seluruh kelas perkuliahan terkait
+  if (updatedData.dosenId) {
+    try {
+      const [users, currentClasses] = await Promise.all([
+        getLocal(STORAGE_KEYS.USERS, INITIAL_USERS),
+        getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES)
+      ]);
+      const targetDosen = users.find(u => u.uid === updatedData.dosenId || u.id === updatedData.dosenId);
+      if (targetDosen) {
+        const syncedClasses = currentClasses.map(c => {
+          if (c.mataKuliahId === mkId || c.kodeMk === updatedData.kodeMk) {
+            return {
+              ...c,
+              dosenId: targetDosen.uid || targetDosen.id,
+              namaDosen: targetDosen.name || c.namaDosen,
+              dosenNidn: targetDosen.nidn || c.dosenNidn || '',
+              dosenEmail: targetDosen.email || c.dosenEmail || ''
+            };
+          }
+          return c;
+        });
+        await setLocal(STORAGE_KEYS.CLASSES, syncedClasses);
+        notifyDataChange(STORAGE_KEYS.CLASSES, syncedClasses);
+      }
+    } catch (syncErr) {
+      console.warn("Gagal sinkronisasi kelas dari update mata kuliah:", syncErr);
+    }
+  }
+
+  await logAudit(user, 'UPDATE_MK', `Memperbarui Mata Kuliah ${updatedData.kodeMk || ''} - ${updatedData.namaMk || ''}`);
+  return updated;
+}
+
+export async function deleteMataKuliah(mkId, user) {
+  if (!mkId) throw new Error("ID Mata Kuliah tidak valid");
+  const list = await getLocal(STORAGE_KEYS.MK, INITIAL_MK);
+  const target = list.find(m => String(m.id) === String(mkId));
+  const updated = list.filter(m => String(m.id) !== String(mkId));
+
+  // 1. Catat ke STIE_LMS_DELETED_MK agar tidak ter-resurrect
+  try {
+    const delRaw = localStorage.getItem('STIE_LMS_DELETED_MK') || '[]';
+    const delList = JSON.parse(delRaw);
+    const targetIdStr = String(mkId);
+    if (!delList.includes(targetIdStr)) {
+      delList.push(targetIdStr);
+      localStorage.setItem('STIE_LMS_DELETED_MK', JSON.stringify(delList));
+    }
+  } catch (e) {}
+
+  // 2. Hapus langsung dokumen di Cloud Firestore koleksi 'mata_kuliah'
+  if (isRealFirebaseConfigured() && db) {
+    try {
+      await deleteDoc(doc(db, "mata_kuliah", String(mkId)));
+    } catch (e) {
+      console.warn("Direct Firestore deleteMataKuliah warning:", e);
+    }
+  }
+
+  await setLocal(STORAGE_KEYS.MK, updated);
+  await logAudit(user, 'DELETE_MK', `Menghapus Mata Kuliah: ${target?.namaMk || mkId} (${target?.kodeMk || ''})`);
+  return updated;
+}
+
+export async function getUsers() {
+  return await getLocal(STORAGE_KEYS.USERS, INITIAL_USERS);
+}
+
+export async function createUser(userData, currentUser) {
+  const list = await getLocal(STORAGE_KEYS.USERS, INITIAL_USERS);
+  const currentRole = (currentUser?.role || '').toUpperCase();
+  const isSuperAdmin = currentRole === 'SUPER_ADMIN' || currentRole === 'ADMIN';
+  const isBaa = currentRole === 'ADMIN_AKADEMIK' || currentRole === 'AKADEMIK' || currentRole === 'BAA';
+
+  const role = (userData.role || 'MAHASISWA').toUpperCase();
+
+  // Validasi otoritas BAA vs Super Admin
+  if (isBaa && !isSuperAdmin) {
+    if (role !== 'DOSEN' && role !== 'MAHASISWA') {
+      throw new Error("Bagian Akademik (BAA) hanya memiliki wewenang mengelola akun Dosen dan Mahasiswa.");
+    }
+  }
+
+  // Cek duplikasi email / username / NIM
+  const targetEmail = (userData.email || '').trim().toLowerCase();
+  const emailExists = list.some(u => (u.email || '').trim().toLowerCase() === targetEmail);
+  if (emailExists) {
+    throw new Error(`Email ${userData.email} sudah terdaftar dalam sistem.`);
+  }
+
+  const newUid = `user-${role.toLowerCase()}-${Date.now()}`;
+  const defaultPassword = role === 'DOSEN' ? 'dosen123' : 'stienas2026';
+  const newUser = {
+    uid: newUid,
+    id: newUid,
+    name: (userData.name || 'Pengguna Baru').trim(),
+    email: targetEmail,
+    username: (userData.username || targetEmail.split('@')[0] || newUid).trim(),
+    password: userData.password ? userData.password.trim() : defaultPassword,
+    role: role,
+    nim: role === 'MAHASISWA' ? (userData.nim ? String(userData.nim).replace(/\D/g, '') : '') : '',
+    nidn: role === 'DOSEN' ? (userData.nidn ? String(userData.nidn).trim() : '') : '',
+    angkatan: role === 'MAHASISWA' ? (userData.angkatan ? Number(userData.angkatan) : 2026) : null,
+    semester: role === 'MAHASISWA' ? (
+      userData.semester ? Number(userData.semester) : 
+      calculateAcademicStanding(userData.nim, userData.angkatan).semester
+    ) : null,
+    prodiId: userData.prodiId || 'prodi-s1-manajemen',
+    phone: (userData.phone || '').trim(),
+    isActive: userData.isActive !== undefined ? userData.isActive : true,
+    avatarUrl: userData.avatarUrl || `https://ui-avatars.com/api/?name=${encodeURIComponent(userData.name || 'User')}&background=1e3a8a&color=fff`,
+    createdAt: new Date().toISOString()
+  };
+
+  // Bersihkan dari daftar terhapus jika pernah tercatat
+  try {
+    const delRaw = localStorage.getItem('STIE_LMS_DELETED_USERS');
+    if (delRaw) {
+      const delList = JSON.parse(delRaw).filter(id => id !== newUid && id !== newUser.email);
+      localStorage.setItem('STIE_LMS_DELETED_USERS', JSON.stringify(delList));
+    }
+  } catch (e) {}
+
+  // Direct Firestore write attempt jika online
+  if (isRealFirebaseConfigured() && db) {
+    try {
+      const cleanFbDoc = JSON.parse(JSON.stringify(newUser));
+      await setDoc(doc(db, "users", newUid), cleanFbDoc, { merge: true });
+    } catch (e) {
+      console.warn("Direct Firestore createUser setDoc warning (data tetap tersimpan di lokal):", e);
+    }
+  }
+
+  // Sisipkan di posisi pertama agar langsung muncul di paling atas tabel
+  list.unshift(newUser);
+  await setLocal(STORAGE_KEYS.USERS, list);
+
+  // Otomatis sinkronkan kelas perkuliahan sesuai semester jika peran MAHASISWA
+  if (role === 'MAHASISWA') {
+    try {
+      await syncStudentSemesterClasses(newUser);
+    } catch (e) {
+      console.warn("Auto sync semester classes on createUser warning:", e);
+    }
+  }
+
+  await logAudit(
+    currentUser, 
+    'CREATE_USER', 
+    `Menambahkan akun baru: ${newUser.name} (${newUser.email}) sebagai ${newUser.role}`
+  );
+  return newUser;
+}
+
+export async function updateUser(uid, userData, currentUser) {
+  const list = await getLocal(STORAGE_KEYS.USERS, INITIAL_USERS);
+  const target = list.find(u => u.uid === uid || u.id === uid);
+  if (!target) throw new Error("Pengguna tidak ditemukan.");
+
+  const currentRole = (currentUser?.role || '').toUpperCase();
+  const isSuperAdmin = currentRole === 'SUPER_ADMIN' || currentRole === 'ADMIN';
+  const isBaa = currentRole === 'ADMIN_AKADEMIK' || currentRole === 'AKADEMIK' || currentRole === 'BAA';
+
+  // Proteksi hak akses BAA
+  if (isBaa && !isSuperAdmin) {
+    const targetRole = (target.role || '').toUpperCase();
+    if (targetRole === 'SUPER_ADMIN' || targetRole === 'ADMIN_AKADEMIK') {
+      throw new Error("Bagian Akademik (BAA) tidak diizinkan mengubah akun Administrator atau sesama BAA.");
+    }
+    if (userData.role && (userData.role || '').toUpperCase() !== 'DOSEN' && (userData.role || '').toUpperCase() !== 'MAHASISWA') {
+      throw new Error("Bagian Akademik (BAA) hanya dapat mengatur peran Dosen atau Mahasiswa.");
+    }
+  }
+
+  const cleanUserData = { ...userData };
+  if (cleanUserData.role) {
+    cleanUserData.role = (cleanUserData.role || '').toUpperCase();
+  }
+  if (cleanUserData.nim !== undefined) {
+    cleanUserData.nim = String(cleanUserData.nim || '').replace(/\D/g, '');
+  }
+  if (!cleanUserData.password || cleanUserData.password.trim() === '') {
+    delete cleanUserData.password;
+  } else {
+    cleanUserData.password = cleanUserData.password.trim();
+  }
+
+  // Jika akun adalah Mahasiswa, sinkronkan semester berdasarkan angkatan/NIM
+  if ((target.role || '').toUpperCase() === 'MAHASISWA' || (cleanUserData.role || '').toUpperCase() === 'MAHASISWA') {
+    const effAngkatan = cleanUserData.angkatan !== undefined ? cleanUserData.angkatan : target.angkatan;
+    const effNim = cleanUserData.nim !== undefined ? cleanUserData.nim : target.nim;
+    if (cleanUserData.semester === undefined && (cleanUserData.angkatan !== undefined || cleanUserData.nim !== undefined)) {
+      const standing = calculateAcademicStanding(effNim, effAngkatan);
+      cleanUserData.semester = standing.semester;
+    }
+  }
+
+  // Update langsung ke Firestore jika online
+  if (isRealFirebaseConfigured() && db) {
+    try {
+      await setDoc(doc(db, "users", String(uid)), cleanUserData, { merge: true });
+    } catch (e) {
+      console.warn("Direct Firestore updateUser setDoc warning:", e);
+    }
+  }
+
+  const updated = list.map(u => {
+    if (u.uid === uid || u.id === uid) {
+      return {
+        ...u,
+        ...cleanUserData,
+        uid: u.uid || uid,
+        id: u.id || uid
+      };
+    }
+    return u;
+  });
+
+  await setLocal(STORAGE_KEYS.USERS, updated);
+
+  const finalUser = updated.find(u => u.uid === uid || u.id === uid);
+  if (finalUser && (finalUser.role || '').toUpperCase() === 'MAHASISWA') {
+    try {
+      await syncStudentSemesterClasses(finalUser);
+    } catch (e) {}
+  }
+
+  await logAudit(
+    currentUser, 
+    'UPDATE_USER', 
+    `Memperbarui profil akun: ${target.name} (${target.email})${cleanUserData.password ? ' [Termasuk Reset Kata Sandi]' : ''}`
+  );
+  return updated;
+}
+
+export async function deleteUser(targetUserOrUid, currentUser) {
+  const list = await getLocal(STORAGE_KEYS.USERS, INITIAL_USERS);
+  
+  const targetId = typeof targetUserOrUid === 'object' && targetUserOrUid !== null
+    ? (targetUserOrUid.uid || targetUserOrUid.id || targetUserOrUid.email)
+    : targetUserOrUid;
+
+  if (!targetId) {
+    throw new Error("Identitas pengguna yang akan dihapus tidak valid.");
+  }
+
+  // Cari akun target di daftar pengguna lokal ataupun INITIAL_USERS
+  const target = list.find(u => 
+    (u.uid && u.uid === targetId) || 
+    (u.id && u.id === targetId) || 
+    (u.email && u.email.toLowerCase() === String(targetId).toLowerCase())
+  ) || INITIAL_USERS.find(u => 
+    (u.uid && u.uid === targetId) || 
+    (u.id && u.id === targetId) || 
+    (u.email && u.email.toLowerCase() === String(targetId).toLowerCase())
+  ) || (typeof targetUserOrUid === 'object' ? targetUserOrUid : null);
+
+  if (!target) {
+    throw new Error("Pengguna tidak ditemukan dalam sistem.");
+  }
+
+  const effectiveTarget = {
+    ...(typeof targetUserOrUid === 'object' ? targetUserOrUid : {}),
+    ...target
+  };
+
+  const activeUser = currentUser || (typeof localStorage !== 'undefined' ? JSON.parse(localStorage.getItem('STIE_LMS_ACTIVE_USER') || 'null') : null);
+  const currentUid = activeUser?.uid || activeUser?.id;
+  const currentEmail = (activeUser?.email || '').toLowerCase().trim();
+  const targetUid = effectiveTarget.uid || effectiveTarget.id;
+  const targetEmail = (effectiveTarget.email || '').toLowerCase().trim();
+
+  // Validasi: Cegah menghapus akun yang sedang dipakai login saat ini
+  if (currentUid && targetUid && String(currentUid) === String(targetUid)) {
+    throw new Error("Anda tidak dapat menghapus akun Anda sendiri.");
+  }
+  if (currentEmail && targetEmail && currentEmail === targetEmail) {
+    throw new Error("Anda tidak dapat menghapus akun Anda sendiri.");
+  }
+
+  // Proteksi integritas: Hanya akun sistem inti yang tidak dapat dihapus
+  const coreProtectedUids = ['user-admin-1', 'user-admin-2'];
+  const coreProtectedEmails = ['admin@stienas.ac.id', 'superadmin@stienas.ac.id', 'akademik@stienas.ac.id', 'adminakademik@stienas.ac.id'];
+  if (coreProtectedUids.includes(targetUid) || coreProtectedEmails.includes(targetEmail)) {
+    throw new Error("Akun sistem inti tidak dapat dihapus demi integritas LMS.");
+  }
+
+  const currentRole = (activeUser?.role || '').toUpperCase();
+  const isSuperAdmin = currentRole === 'SUPER_ADMIN' || currentRole === 'ADMIN';
+  const isBaa = currentRole === 'ADMIN_AKADEMIK' || currentRole === 'AKADEMIK' || currentRole === 'BAA';
+
+  // Proteksi hak akses BAA
+  if (isBaa && !isSuperAdmin) {
+    const targetRole = (effectiveTarget.role || '').toUpperCase();
+    if (targetRole === 'SUPER_ADMIN' || targetRole === 'ADMIN_AKADEMIK' || targetRole === 'AKADEMIK' || targetRole === 'BAA') {
+      throw new Error("Bagian Akademik (BAA) tidak diizinkan menghapus akun Administrator atau sesama BAA.");
+    }
+  }
+
+  // Kumpulkan seluruh identitas akun untuk dimasukkan ke daftar terhapus permanen
+  const idsToBlacklist = [
+    effectiveTarget.uid,
+    effectiveTarget.id,
+    targetId,
+    targetEmail,
+    effectiveTarget.username ? String(effectiveTarget.username).toLowerCase().trim() : null,
+    effectiveTarget.nim ? String(effectiveTarget.nim).trim() : null,
+    effectiveTarget.nidn ? String(effectiveTarget.nidn).trim() : null
+  ].filter(Boolean);
+
+  // Tandai di STIE_LMS_DELETED_USERS agar tidak dibangkitkan kembali oleh Firestore getLocal
+  try {
+    const delRaw = localStorage.getItem('STIE_LMS_DELETED_USERS') || '[]';
+    const delList = JSON.parse(delRaw);
+    idsToBlacklist.forEach(idKey => {
+      if (!delList.includes(idKey)) {
+        delList.push(idKey);
+      }
+    });
+    localStorage.setItem('STIE_LMS_DELETED_USERS', JSON.stringify(delList));
+  } catch (e) {}
+
+  // Direct Firestore deleteUser deleteDoc attempt untuk semua doc id terkait
+  if (isRealFirebaseConfigured() && db) {
+    const docIdsToDelete = new Set([
+      effectiveTarget.uid,
+      effectiveTarget.id,
+      String(targetId)
+    ].filter(Boolean));
+
+    for (const docId of docIdsToDelete) {
+      try {
+        await deleteDoc(doc(db, "users", String(docId)));
+      } catch (e) {
+        console.warn(`Direct Firestore deleteUser deleteDoc warning for ${docId}:`, e);
+      }
+    }
+  }
+
+  const updated = list.filter(u => !isUserDeleted(u, idsToBlacklist));
+  await setLocal(STORAGE_KEYS.USERS, updated);
+
+  // Bersihkan juga mahasiswa dari seluruh kelas perkuliahan (enrolledStudents, grades, attendances)
+  try {
+    const classList = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+    let classModified = false;
+    const userKeys = idsToBlacklist;
+    classList.forEach(c => {
+      if (Array.isArray(c.enrolledStudents)) {
+        const originalLen = c.enrolledStudents.length;
+        c.enrolledStudents = c.enrolledStudents.filter(id => !userKeys.includes(id));
+        if (c.enrolledStudents.length !== originalLen) classModified = true;
+      }
+      if (c.grades) {
+        userKeys.forEach(k => {
+          if (c.grades[k]) {
+            delete c.grades[k];
+            classModified = true;
+          }
+        });
+      }
+    });
+    if (classModified) {
+      await setLocal(STORAGE_KEYS.CLASSES, classList);
+    }
+  } catch (e) {
+    console.warn("Clean classes on deleteUser error:", e);
+  }
+
+  try {
+    await logAudit(
+      activeUser, 
+      'DELETE_USER', 
+      `Menghapus akun: ${effectiveTarget.name || targetEmail} (${effectiveTarget.email || targetEmail} - ${effectiveTarget.role || 'MAHASISWA'})`
+    );
+  } catch (e) {}
+
+  return updated;
+}
+
+export async function resetUserPassword(uid, newPassword, currentUser) {
+  const list = await getLocal(STORAGE_KEYS.USERS, INITIAL_USERS);
+  const target = list.find(u => u.uid === uid);
+  if (!target) throw new Error("Pengguna tidak ditemukan.");
+
+  const currentRole = (currentUser?.role || '').toUpperCase();
+  const isSuperAdmin = currentRole === 'SUPER_ADMIN' || currentRole === 'ADMIN';
+  const isBaa = currentRole === 'ADMIN_AKADEMIK' || currentRole === 'AKADEMIK' || currentRole === 'BAA';
+
+  // Proteksi hak akses BAA
+  if (isBaa && !isSuperAdmin) {
+    if (target.role === 'SUPER_ADMIN' || target.role === 'ADMIN_AKADEMIK') {
+      throw new Error("Bagian Akademik (BAA) tidak diizinkan mereset kata sandi Administrator.");
+    }
+  }
+
+  const passwordToSet = (newPassword && newPassword.trim()) || 'stienas2026';
+  const updated = list.map(u => {
+    if (u.uid === uid) {
+      return { ...u, password: passwordToSet };
+    }
+    return u;
+  });
+
+  await setLocal(STORAGE_KEYS.USERS, updated);
+  // Sync password ke Firestore
+  if (isRealFirebaseConfigured() && db) {
+    try {
+      await setDoc(doc(db, 'users', String(uid)), { password: passwordToSet }, { merge: true });
+    } catch (e) {
+      console.warn('Firestore resetUserPassword warning:', e);
+    }
+  }
+  await logAudit(
+    currentUser, 
+    'RESET_PASSWORD', 
+    `Mereset kata sandi akun: ${target.name} (${target.email})`
+  );
+  return passwordToSet;
+}
+
+export async function registerStudent(studentData) {
+  const emailClean = (studentData.email || '').trim().toLowerCase();
+
+  if (!emailClean || !emailClean.includes('@') || !emailClean.includes('.')) {
+    throw new Error("Alamat email tidak valid. Pastikan format email benar (contoh: nama@gmail.com).");
+  }
+
+  // 1. Ambil daftar pengguna terbaru dari database Firestore & lokal secara akurat
+  let list = [];
+  try {
+    list = await getUsers();
+  } catch (e) {
+    const raw = localStorage.getItem(STORAGE_KEYS.USERS);
+    list = raw ? JSON.parse(raw) : [...INITIAL_USERS];
+  }
+
+  // 2. Cek apakah email sudah terdaftar sebelumnya
+  // Cari di list yang sudah terfilter (tidak termasuk akun yang sudah terhapus)
+  const existingIdx = list.findIndex(u => (u.email || '').trim().toLowerCase() === emailClean && u.isActive !== false);
+  // Fallback: cari juga di akun tidak aktif
+  const existingIdxFull = existingIdx >= 0 ? existingIdx : list.findIndex(u => (u.email || '').trim().toLowerCase() === emailClean);
+  const existingUser = existingIdxFull >= 0 ? list[existingIdxFull] : null;
+
+  // Jika akun yang terdaftar merupakan akun staf/dosen, jangan izinkan ditimpa pendaftaran mahasiswa
+  if (existingUser) {
+    const exRole = (existingUser.role || '').toUpperCase();
+    if (exRole === 'SUPER_ADMIN' || exRole === 'ADMIN' || exRole === 'ADMIN_AKADEMIK' || exRole === 'BAA' || exRole === 'DOSEN') {
+      throw new Error(`Email '${studentData.email}' sudah digunakan untuk akun dinas LMS STIE Nasional (${exRole}). Silakan gunakan halaman Masuk/Login dengan email tersebut.`);
+    }
+    // Jika akun mahasiswa sudah ada, lakukan UPDATE (bukan error)
+    // Ini memungkinkan mahasiswa yang pernah terdaftar untuk memperbarui data
+  }
+
+  // 3. Tentukan NIM yang valid dan bebas benturan (unique)
+  let effectiveNim = studentData.nim ? String(studentData.nim).replace(/\D/g, '') : '';
+  const angkatanVal = studentData.angkatan ? Number(studentData.angkatan) : (existingUser?.angkatan || 2026);
+  const prodiVal = studentData.prodiId || existingUser?.prodiId || 'prodi-s1-manajemen';
+
+  const isNimTakenByOther = effectiveNim && list.some(u => 
+    String(u.nim || '').trim() === effectiveNim && 
+    (u.email || '').trim().toLowerCase() !== emailClean
+  );
+
+  if (!effectiveNim || isNimTakenByOther) {
+    const yearPrefix = String(angkatanVal).slice(-2);
+    const prodiPrefix = prodiVal === 'prodi-s1-akuntansi' ? '2011' : '1011';
+    let rand = Math.floor(100 + Math.random() * 900);
+    while (list.some(u => String(u.nim || '').trim() === `${yearPrefix}${prodiPrefix}${rand}` && (u.email || '').trim().toLowerCase() !== emailClean)) {
+      rand = Math.floor(100 + Math.random() * 900);
+    }
+    effectiveNim = `${yearPrefix}${prodiPrefix}${rand}`;
+  }
+
+  const targetUid = existingUser ? (existingUser.uid || existingUser.id) : `user-mhs-${Date.now()}`;
+  const username = (emailClean.split('@')[0] || targetUid).trim().toLowerCase();
+
+  const studentObj = {
+    ...(existingUser || {}),
+    uid: targetUid,
+    id: targetUid,
+    name: (studentData.name || existingUser?.name || 'Mahasiswa Baru').trim(),
+    email: emailClean,
+    username,
+    password: (studentData.password && studentData.password.trim()) || existingUser?.password || 'mhs2026',
+    role: 'MAHASISWA',
+    nim: effectiveNim,
+    nidn: '',
+    angkatan: angkatanVal,
+    semester: existingUser?.semester ? Number(existingUser.semester) : (calculateAcademicStanding(effectiveNim, angkatanVal).semester || 1),
+    prodiId: prodiVal,
+    phone: (studentData.phone || existingUser?.phone || '').trim(),
+    isActive: true,
+    avatarUrl: existingUser?.avatarUrl || `https://ui-avatars.com/api/?name=${encodeURIComponent(studentData.name || 'Mahasiswa')}&background=1e3a8a&color=fff`,
+    updatedAt: new Date().toISOString()
+  };
+
+  if (!existingUser) {
+    studentObj.createdAt = new Date().toISOString();
+  }
+
+  // 4. Bersihkan dari blacklist akun terhapus (STIE_LMS_DELETED_USERS)
+  try {
+    const delRaw = localStorage.getItem('STIE_LMS_DELETED_USERS');
+    if (delRaw) {
+      const delList = JSON.parse(delRaw).filter(id => 
+        id !== targetUid && 
+        id !== emailClean && 
+        id !== effectiveNim &&
+        id !== username
+      );
+      localStorage.setItem('STIE_LMS_DELETED_USERS', JSON.stringify(delList));
+    }
+  } catch (e) {}
+
+  // 5. Perbarui list pengguna
+  const finalUpdateIdx = existingIdxFull >= 0 ? existingIdxFull : existingIdx;
+  if (finalUpdateIdx >= 0) {
+    list[finalUpdateIdx] = studentObj;
+  } else {
+    list.unshift(studentObj);
+  }
+
+  localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(list));
+  notifyDataChange(STORAGE_KEYS.USERS, list);
+
+  // 6. Sinkronisasi dokumen pengguna ke Firestore secara langsung
+  if (isRealFirebaseConfigured() && db && targetUid) {
+    try {
+      const cleanFbDoc = JSON.parse(JSON.stringify(studentObj));
+      await setDoc(doc(db, "users", String(targetUid)), cleanFbDoc, { merge: true });
+    } catch (e) {
+      console.warn("Direct Firestore registerStudent setDoc warning:", e);
+    }
+  }
+
+  // 7. Otomatis sinkronisasi kelas perkuliahan paket semester untuk mahasiswa yang baru mendaftar
+  try {
+    await syncStudentSemesterClasses(studentObj);
+  } catch (e) {
+    console.warn("Auto sync semester classes on registerStudent warning:", e);
+  }
+
+  // 8. Audit log (non-blocking)
+  logAudit(
+    studentObj, 
+    existingUser ? 'UPDATE_STUDENT_REGISTRATION' : 'REGISTER_STUDENT', 
+    `Mahasiswa mendaftar mandiri: ${studentObj.name} (${studentObj.nim}) - ${studentObj.email}`
+  ).catch(e => console.warn("Audit log error:", e));
+
+  return studentObj;
+}
+
+export async function toggleUserActive(uid, user) {
+  const list = await getLocal(STORAGE_KEYS.USERS, INITIAL_USERS);
+  let statusChangedTo = false;
+  const target = list.find(u => u.uid === uid);
+  if (!target) return list;
+
+  const currentRole = (user?.role || '').toUpperCase();
+  const isSuperAdmin = currentRole === 'SUPER_ADMIN' || currentRole === 'ADMIN';
+  const isBaa = currentRole === 'ADMIN_AKADEMIK' || currentRole === 'AKADEMIK' || currentRole === 'BAA';
+
+  if (isBaa && !isSuperAdmin && (target.role === 'SUPER_ADMIN' || target.role === 'ADMIN_AKADEMIK')) {
+    throw new Error("Bagian Akademik (BAA) tidak diizinkan mengubah status Administrator.");
+  }
+
+  const updated = list.map(u => {
+    if (u.uid === uid) {
+      statusChangedTo = !u.isActive;
+      return { ...u, isActive: !u.isActive };
+    }
+    return u;
+  });
+  await setLocal(STORAGE_KEYS.USERS, updated);
+  // Sync ke Firestore
+  if (isRealFirebaseConfigured() && db) {
+    try {
+      await setDoc(doc(db, 'users', String(uid)), { isActive: statusChangedTo }, { merge: true });
+    } catch (e) {
+      console.warn('Firestore toggleUserActive warning:', e);
+    }
+  }
+  await logAudit(user, 'TOGGLE_USER_STATUS', `Mengubah status user ${target.name} menjadi ${statusChangedTo ? 'AKTIF' : 'NON-AKTIF'}`);
+  return updated;
+}
+
+export async function batchImportData(type, items, user) {
+  if (type === 'MATA_KULIAH') {
+    const current = await getLocal(STORAGE_KEYS.MK, INITIAL_MK);
+    const updated = [...current, ...items.map(i => ({ ...i, id: i.id || `mk-${Date.now()}-${Math.random().toString(36).substr(2, 5)}` }))];
+    await setLocal(STORAGE_KEYS.MK, updated);
+  } else if (type === 'DOSEN' || type === 'MAHASISWA') {
+    const current = await getLocal(STORAGE_KEYS.USERS, INITIAL_USERS);
+    const updated = [...current, ...items.map(i => ({ 
+      ...i, 
+      nim: type === 'MAHASISWA' && i.nim ? String(i.nim).replace(/\D/g, '') : i.nim,
+      uid: i.uid || `user-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
+      role: type === 'DOSEN' ? 'DOSEN' : 'MAHASISWA',
+      isActive: true 
+    }))];
+    await setLocal(STORAGE_KEYS.USERS, updated);
+  }
+  await logAudit(user, 'BATCH_IMPORT', `Impor massal ${items.length} data tipe ${type}`);
+  return true;
+}
+
+/* =========================================================================
+   3. KELAS KULIAH & 16 PERTEMUAN (FR-03)
+   ========================================================================= */
+
+/**
+ * Helper untuk memvalidasi apakah suatu kelas perkuliahan ditugaskan kepada Dosen tertentu oleh BAA.
+ * Aturan:
+ * 1. Dosen Pengampu Utama kelas yang bersangkutan (pencocokan UID, NIDN, Email, Username, atau Nama fleksibel).
+ * 2. ATAU Dosen yang masuk dalam Tim Pengajar / Team Teaching kelas tersebut.
+ * 3. ATAU Dosen default pada Mata Kuliah kelas tersebut.
+ */
+export function isClassAssignedToLecturer(cls, lecturer, mks = []) {
+  if (!cls || !lecturer) return false;
+  const lecturerUid = lecturer.uid ? String(lecturer.uid).trim() : '';
+  const lecturerId = lecturer.id ? String(lecturer.id).trim() : '';
+  const lecturerNidn = lecturer.nidn ? String(lecturer.nidn).trim() : '';
+  const lecturerEmail = lecturer.email ? String(lecturer.email).trim().toLowerCase() : '';
+  const lecturerUsername = lecturer.username ? String(lecturer.username).trim().toLowerCase() : '';
+  const lecturerName = lecturer.name ? String(lecturer.name).trim().toLowerCase() : '';
+
+  // Helper normalisasi nama: hilangkan gelar akademik dan karakter non-alfanumerik
+  const stripAcademicTitles = (str) => {
+    return (str || '')
+      .toLowerCase()
+      .replace(/\b(dr|drs|dra|h|hj|se|mm|m\.si|msi|m\.ak|mak|m\.pd|mpd|s\.pd|spd|s\.e|s\.kom|m\.kom|ph\.d|ak)\b/gi, '')
+      .replace(/[^a-z0-9]/g, '')
+      .trim();
+  };
+
+  const cleanLecturer = stripAcademicTitles(lecturerName);
+
+  const matchesLecturer = (targetId, targetNidn, targetEmail, targetName) => {
+    const tid = targetId ? String(targetId).trim() : '';
+    const tnidn = targetNidn ? String(targetNidn).trim() : '';
+    const temail = targetEmail ? String(targetEmail).trim().toLowerCase() : '';
+    const tname = targetName ? String(targetName).trim().toLowerCase() : '';
+    const cleanTarget = stripAcademicTitles(tname);
+
+    if (tid && (tid === lecturerUid || tid === lecturerId)) return true;
+    if (lecturerNidn && (tnidn === lecturerNidn || tid === lecturerNidn)) return true;
+    if (lecturerEmail && (temail === lecturerEmail || tid === lecturerEmail)) return true;
+    if (lecturerUsername && (temail.startsWith(`${lecturerUsername}@`) || tid === lecturerUsername)) return true;
+    // Pencocokan nama lebih ketat: hanya exact match atau substring panjang (min 5 karakter) untuk mencegah false-positive
+    if (tname && lecturerName && tname === lecturerName) return true;
+    if (cleanLecturer && cleanLecturer.length > 5 && cleanTarget && cleanTarget.length > 5 &&
+        (cleanTarget.includes(cleanLecturer) || cleanLecturer.includes(cleanTarget))) return true;
+    return false;
+  };
+
+  // 1. Cocokkan langsung dengan Dosen Pengampu Utama di kelas
+  if (matchesLecturer(cls.dosenId, cls.dosenNidn, cls.dosenEmail, cls.namaDosen)) {
+    return true;
+  }
+
+  // 2. Cocokkan jika Dosen masuk dalam Tim Pengajar / Team Teaching kelas
+  const teamLists = [
+    cls.teamTeaching,
+    cls.dosenTeam,
+    cls.dosenPengajar,
+    cls.teamDosen,
+    cls.dosenIds
+  ];
+
+  for (const list of teamLists) {
+    if (Array.isArray(list)) {
+      for (const item of list) {
+        if (!item) continue;
+        if (typeof item === 'string' || typeof item === 'number') {
+          const s = String(item).trim();
+          if (
+            s === lecturerUid || 
+            s === lecturerId || 
+            (lecturerNidn && s === lecturerNidn) || 
+            (lecturerEmail && s.toLowerCase() === lecturerEmail) ||
+            (lecturerUsername && s.toLowerCase() === lecturerUsername)
+          ) {
+            return true;
+          }
+        } else if (typeof item === 'object') {
+          if (matchesLecturer(item.uid || item.id, item.nidn, item.email, item.name || item.namaDosen)) {
+            return true;
+          }
+        }
+      }
+    }
+  }
+
+  // 3. Cocokkan dari Mata Kuliah default jika parameter mks disertakan
+  if (Array.isArray(mks) && mks.length > 0) {
+    const mk = mks.find(m => String(m.id) === String(cls.mataKuliahId) || m.kodeMk === cls.kodeMk);
+    if (mk && matchesLecturer(mk.dosenId, mk.dosenNidn, mk.dosenEmail, mk.dosenNama || mk.namaDosen)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+export async function syncClassMeetingsToFirestore(classItem) {
+  if (isRealFirebaseConfigured() && db && classItem) {
+    try {
+      const docId = String(classItem.uid || classItem.id || '');
+      if (docId) {
+        await setDoc(doc(db, "kelas_kuliah", docId), {
+          meetings: classItem.meetings,
+          enrolledStudents: Array.isArray(classItem.enrolledStudents) ? classItem.enrolledStudents : [],
+          grades: classItem.grades || {}
+        }, { merge: true });
+      }
+    } catch (fsErr) {
+      console.warn("Firestore syncClassMeetings warning:", fsErr);
+    }
+  }
+}
+
+export async function getClasses() {
+  const classes = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+  return (classes || []).map(cls => {
+    if (!Array.isArray(cls.meetings) || cls.meetings.length === 0) {
+      cls.meetings = generateDefault16Meetings(cls.namaMk || 'Mata Kuliah');
+    }
+    return cls;
+  });
+}
+
+export async function getClassById(classId) {
+  const list = await getClasses();
+  const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId)) || null;
+  if (classItem && (!Array.isArray(classItem.meetings) || classItem.meetings.length === 0)) {
+    classItem.meetings = generateDefault16Meetings(classItem.namaMk || 'Mata Kuliah');
+  }
+  return classItem;
+}
+
+export async function createClass(classData, user) {
+  const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+  const classId = `kelas-${Date.now()}`;
+  
+  // FR-03.2 Otomatis generate 16 pertemuan
+  const meetings = generateDefault16Meetings(classData.namaMk || 'Mata Kuliah');
+
+  const newClass = {
+    id: classId,
+    ...classData,
+    progressPercentage: 0,
+    enrolledStudents: [],
+    meetings,
+    grades: {},
+    createdAt: new Date().toISOString()
+  };
+
+  list.push(newClass);
+  // Bersihkan dari daftar kelas yang terhapus jika ID digunakan kembali
+  try {
+    const delRaw = localStorage.getItem('STIE_LMS_DELETED_CLASSES');
+    if (delRaw) {
+      const delList = JSON.parse(delRaw).filter(id => id !== String(classId));
+      localStorage.setItem('STIE_LMS_DELETED_CLASSES', JSON.stringify(delList));
+    }
+  } catch (e) {}
+  await setLocal(STORAGE_KEYS.CLASSES, list);
+
+  // Sync ke Firestore
+  if (isRealFirebaseConfigured() && db) {
+    try {
+      const cleanDoc = JSON.parse(JSON.stringify(newClass));
+      await setDoc(doc(db, 'kelas_kuliah', String(classId)), cleanDoc, { merge: true });
+    } catch (e) {
+      console.warn('Firestore createClass warning:', e);
+    }
+  }
+
+  await logAudit(user, 'CREATE_CLASS', `Membuka kelas ${newClass.namaMk} (${newClass.namaKelas}) dengan otomatisasi 16 pertemuan.`);
+  return newClass;
+}
+
+export async function updateClass(classId, classData, user) {
+  const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+  const index = list.findIndex(c => c.id === classId);
+  if (index === -1) throw new Error("Kelas perkuliahan tidak ditemukan");
+
+  const currentRole = (user?.role || '').toUpperCase();
+  const isSuperAdmin = currentRole === 'SUPER_ADMIN' || currentRole === 'ADMIN';
+  const isBaa = currentRole === 'ADMIN_AKADEMIK' || currentRole === 'AKADEMIK' || currentRole === 'BAA';
+  if (!isSuperAdmin && !isBaa) {
+    throw new Error("Hanya Administrator dan BAA yang memiliki wewenang mengubah data kelas perkuliahan.");
+  }
+
+  list[index] = {
+    ...list[index],
+    ...classData
+  };
+
+  await setLocal(STORAGE_KEYS.CLASSES, list);
+
+  if (isRealFirebaseConfigured() && db) {
+    try {
+      const classDocRef = doc(db, "kelas_kuliah", String(classId));
+      await setDoc(classDocRef, list[index], { merge: true });
+    } catch (e) {
+      console.warn("Firestore updateClass sync error:", e);
+    }
+  }
+
+  await logAudit(user, 'UPDATE_CLASS', `Memperbarui data kelas ${list[index].namaMk} (${list[index].namaKelas})`);
+  return list[index];
+}
+
+export async function deleteClass(classId, user) {
+  if (!classId) throw new Error("ID kelas perkuliahan tidak valid");
+
+  const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+  const target = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
+  if (!target) throw new Error("Kelas perkuliahan tidak ditemukan");
+
+  let activeUser = user;
+  if (!activeUser?.role) {
+    try {
+      const stored = localStorage.getItem('STIE_LMS_ACTIVE_USER');
+      if (stored) activeUser = JSON.parse(stored);
+    } catch (e) {}
+  }
+
+  const currentRole = (activeUser?.role || '').toUpperCase();
+  const isSuperAdmin = currentRole === 'SUPER_ADMIN' || currentRole === 'ADMIN';
+  const isBaa = currentRole === 'ADMIN_AKADEMIK' || currentRole === 'AKADEMIK' || currentRole === 'BAA' || isSuperAdmin;
+  if (!isSuperAdmin && !isBaa) {
+    throw new Error("Hanya Administrator dan Bagian Administrasi Akademik (BAA) yang memiliki wewenang menghapus kelas perkuliahan.");
+  }
+
+  // 1. Simpan ke STIE_LMS_DELETED_CLASSES agar tidak dibangkitkan kembali oleh Firestore getLocal atau re-seed
+  try {
+    const delRaw = localStorage.getItem('STIE_LMS_DELETED_CLASSES') || '[]';
+    const delList = JSON.parse(delRaw);
+    const targetIdStr = String(classId);
+    if (!delList.includes(targetIdStr)) {
+      delList.push(targetIdStr);
+      localStorage.setItem('STIE_LMS_DELETED_CLASSES', JSON.stringify(delList));
+    }
+  } catch (e) {
+    console.warn("LocalStorage save deleted class error:", e);
+  }
+
+  // 2. Hapus langsung dokumen di Cloud Firestore koleksi 'kelas_kuliah' (Bukan 'classes')
+  if (isRealFirebaseConfigured() && db) {
+    try {
+      await deleteDoc(doc(db, "kelas_kuliah", String(classId)));
+    } catch (e) {
+      console.warn("Firestore deleteClass direct deleteDoc error:", e);
+    }
+  }
+
+  // 3. Update localStorage dan kirim event sinkronisasi real-time
+  const updated = list.filter(c => String(c.id) !== String(classId) && String(c.uid || '') !== String(classId));
+  await setLocal(STORAGE_KEYS.CLASSES, updated);
+
+  // 4. Catat riwayat ke Audit Logs
+  await logAudit(activeUser, 'DELETE_CLASS', `Menghapus kelas perkuliahan: ${target.namaMk} (${target.namaKelas})`);
+  return true;
+}
+
+export async function enrollStudent(classId, mhsId, user, options = {}) {
+  const [list, mks, users] = await Promise.all([
+    getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES),
+    getLocal(STORAGE_KEYS.MK, INITIAL_MK),
+    getLocal(STORAGE_KEYS.USERS, INITIAL_USERS)
+  ]);
+  const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
+  if (!classItem) throw new Error("Kelas perkuliahan tidak ditemukan");
+
+  const actorRole = (user?.role || '').toUpperCase();
+  const isActorAdminOrBaa = actorRole === 'SUPER_ADMIN' || actorRole === 'ADMIN' || actorRole === 'ADMIN_AKADEMIK' || actorRole === 'AKADEMIK' || actorRole === 'BAA';
+
+  // Pengecekan kuota (Admin/BAA dapat memiliki opsi bypass kuota jika diberikan izin dispensasi)
+  const currentCount = (classItem.enrolledStudents || []).length;
+  const maxQuota = Number(classItem.kuota || 40);
+  if (!options.bypassQuota && currentCount >= maxQuota) {
+    throw new Error(`Kuota kelas telah penuh (${currentCount}/${maxQuota} mahasiswa)! Hubungi Bagian Akademik (BAA).`);
+  }
+
+  if ((classItem.enrolledStudents || []).includes(mhsId)) {
+    throw new Error("Mahasiswa sudah terdaftar di kelas ini");
+  }
+
+  // Validasi Prasyarat Semester & Kesesuaian Prodi KRS Mahasiswa
+  // Jika dioperasikan oleh Admin/BAA dengan dispensasi (options.bypassRestrictions atau isActorAdminOrBaa), lewati pembatasan jika opsi aktif
+  const student = users.find(u => String(u.uid || u.id) === String(mhsId)) || user;
+  const mk = mks.find(m => String(m.id) === String(classItem.mataKuliahId) || m.kodeMk === classItem.kodeMk);
+
+  if (!options.bypassRestrictions && !isActorAdminOrBaa && student && mk) {
+    const standing = calculateAcademicStanding(student.nim, student.angkatan);
+    const studentSemester = standing?.semester || (student.semester ? Number(student.semester) : 1);
+    const courseSemester = Number(mk.semesterDefault || 1);
+
+    if (studentSemester < courseSemester) {
+      throw new Error(`Pengambilan kelas ditolak: Mata kuliah "${mk.namaMk}" dialokasikan untuk Semester ${courseSemester}. Anda saat ini berada di Semester ${studentSemester} (Angkatan ${student.angkatan || '-'}).`);
+    }
+
+    if (student.prodiId && mk.prodiId && student.prodiId !== mk.prodiId) {
+      throw new Error(`Pengambilan kelas ditolak: Mata kuliah "${mk.namaMk}" dialokasikan khusus untuk Program Studi lain.`);
+    }
+  }
+
+  if (!classItem.enrolledStudents) classItem.enrolledStudents = [];
+  classItem.enrolledStudents.push(mhsId);
+  await setLocal(STORAGE_KEYS.CLASSES, list);
+
+  // Sync perubahan pendaftaran ke Firestore
+  if (isRealFirebaseConfigured() && db) {
+    try {
+      const docId = String(classItem.uid || classItem.id);
+      await setDoc(doc(db, "kelas_kuliah", docId), {
+        enrolledStudents: classItem.enrolledStudents
+      }, { merge: true });
+    } catch (e) {
+      console.warn("Firestore enrollStudent sync error:", e);
+    }
+  }
+
+  const studentLabel = student?.name ? `${student.name} (${student.nim || student.username || mhsId})` : mhsId;
+  const controllerPrefix = isActorAdminOrBaa 
+    ? `${actorRole === 'SUPER_ADMIN' || actorRole === 'ADMIN' ? 'Super Admin' : 'Admin BAA'} (${user?.name || 'Admin'}) mendaftarkan secara manual` 
+    : 'Mahasiswa mandiri mendaftar';
+  await logAudit(user, 'ENROLL_STUDENT', `${controllerPrefix} mahasiswa ${studentLabel} ke kelas ${classItem.namaMk} (${classItem.namaKelas || '-'})`);
+  return classItem;
+}
+
+export async function unenrollStudent(classId, mhsId, user) {
+  const [list, users] = await Promise.all([
+    getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES),
+    getLocal(STORAGE_KEYS.USERS, INITIAL_USERS)
+  ]);
+  const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
+  if (!classItem) throw new Error("Kelas perkuliahan tidak ditemukan");
+
+  if (!classItem.enrolledStudents || !classItem.enrolledStudents.includes(mhsId)) {
+    throw new Error("Mahasiswa tidak terdaftar dalam kelas ini");
+  }
+
+  classItem.enrolledStudents = classItem.enrolledStudents.filter(id => String(id) !== String(mhsId));
+  await setLocal(STORAGE_KEYS.CLASSES, list);
+
+  // Sync perubahan pengeluaran mahasiswa ke Firestore
+  if (isRealFirebaseConfigured() && db) {
+    try {
+      const docId = String(classItem.uid || classItem.id);
+      await setDoc(doc(db, "kelas_kuliah", docId), {
+        enrolledStudents: classItem.enrolledStudents
+      }, { merge: true });
+    } catch (e) {
+      console.warn("Firestore unenrollStudent sync error:", e);
+    }
+  }
+
+  const student = users.find(u => String(u.uid || u.id) === String(mhsId));
+  const studentLabel = student?.name ? `${student.name} (${student.nim || student.username || mhsId})` : mhsId;
+  const actorRole = (user?.role || '').toUpperCase();
+  const isActorAdmin = actorRole === 'SUPER_ADMIN' || actorRole === 'ADMIN';
+  const roleName = isActorAdmin ? 'Super Admin' : (actorRole === 'DOSEN' ? 'Dosen Pengampu' : 'Admin BAA');
+
+  await logAudit(user, 'UNENROLL_STUDENT', `${roleName} (${user?.name || 'Pengontrol'}) mengeluarkan mahasiswa ${studentLabel} dari kelas ${classItem.namaMk} (${classItem.namaKelas || '-'})`);
+  return classItem;
+}
+
+/**
+ * Sinkronisasi kelas perkuliahan paket semester untuk mahasiswa
+ * Memastikan mahasiswa semester 3 mendapatkan kelas semester 3, semester 1 mendapatkan semester 1, dst.
+ */
+export async function syncStudentSemesterClasses(userOrUid, options = {}) {
+  const [users, tas, classesList, mks] = await Promise.all([
+    getLocal(STORAGE_KEYS.USERS, INITIAL_USERS),
+    getLocal(STORAGE_KEYS.TA, INITIAL_TA),
+    getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES),
+    getLocal(STORAGE_KEYS.MK, INITIAL_MK)
+  ]);
+
+  const targetId = typeof userOrUid === 'object' && userOrUid !== null
+    ? (userOrUid.uid || userOrUid.id || userOrUid.nim)
+    : userOrUid;
+
+  let student = users.find(u => 
+    String(u.uid || u.id) === String(targetId) || 
+    (u.nim && String(u.nim) === String(targetId)) ||
+    (u.email && String(u.email).toLowerCase() === String(targetId).toLowerCase())
+  );
+
+  if (!student && typeof userOrUid === 'object' && userOrUid !== null) {
+    student = userOrUid;
+  }
+
+  if (!student || (student.role || '').toUpperCase() !== 'MAHASISWA') {
+    return { success: false, message: "Pengguna bukan mahasiswa terdaftar.", enrolledClasses: [] };
+  }
+
+  const activeTa = tas.find(t => t.isActive) || tas[0];
+  if (!activeTa) {
+    return { success: false, message: "Tidak ada periode Tahun Akademik yang aktif.", enrolledClasses: [] };
+  }
+
+  // Hitung semester berjalan mahasiswa secara akurat dari angkatan / NIM
+  const standing = calculateAcademicStanding(student.nim, student.angkatan, activeTa);
+  const currentSemester = standing.semester || Number(student.semester) || 1;
+  const prodiId = student.prodiId || 'prodi-s1-manajemen';
+  const studentUid = String(student.uid || student.id);
+
+  // Pastikan field semester di data user tersinkron
+  if (Number(student.semester) !== currentSemester) {
+    student.semester = currentSemester;
+    const userIdx = users.findIndex(u => String(u.uid || u.id) === studentUid);
+    if (userIdx >= 0) {
+      users[userIdx].semester = currentSemester;
+      await setLocal(STORAGE_KEYS.USERS, users);
+    }
+  }
+
+  let newlyEnrolledCount = 0;
+  const enrolledClasses = [];
+
+  const updatedClasses = classesList.map(cls => {
+    // Pastikan kelas berada pada semester aktif
+    // Kelas tanpa tahunAkademikId dianggap aktif (toleran terhadap data lama)
+    const isTaMatch = !cls.tahunAkademikId || 
+                      cls.tahunAkademikId === activeTa.id || 
+                      cls.namaTa === activeTa.namaTa;
+    if (!isTaMatch || cls.status === 'CLOSED') return cls;
+
+    const mk = mks.find(m => String(m.id) === String(cls.mataKuliahId) || m.kodeMk === cls.kodeMk);
+    if (!mk) return cls;
+
+    const courseSemester = Number(mk.semesterDefault || 1);
+    const isProdiMatch = !mk.prodiId || !prodiId || mk.prodiId === prodiId;
+
+    // Sinkronisasi kelas hanya jika semester mata kuliah sama persis dengan semester mahasiswa
+    if (courseSemester === currentSemester && isProdiMatch) {
+      if (!Array.isArray(cls.enrolledStudents)) {
+        cls.enrolledStudents = [];
+      }
+      if (!cls.enrolledStudents.includes(studentUid)) {
+        cls.enrolledStudents.push(studentUid);
+        newlyEnrolledCount++;
+      }
+      enrolledClasses.push(cls);
+    }
+    return cls;
+  });
+
+  if (newlyEnrolledCount > 0) {
+    await setLocal(STORAGE_KEYS.CLASSES, updatedClasses);
+    // Push update ke Firestore secara langsung
+    if (isRealFirebaseConfigured() && db) {
+      for (const enc of enrolledClasses) {
+        try {
+          const docId = String(enc.uid || enc.id);
+          if (docId) {
+            await setDoc(doc(db, "kelas_kuliah", docId), {
+              enrolledStudents: enc.enrolledStudents || []
+            }, { merge: true });
+          }
+        } catch (e) {
+          console.warn("Sync class to Firestore error:", e);
+        }
+      }
+    }
+  }
+
+  return {
+    success: true,
+    studentName: student.name,
+    studentSemester: currentSemester,
+    studentAngkatan: standing.angkatan,
+    newlyEnrolledCount,
+    totalSemesterClasses: enrolledClasses.length,
+    enrolledClasses
+  };
+}
+
+/**
+ * Sinkronisasi massal data kelas perkuliahan seluruh mahasiswa berdasarkan semester berjalan (Admin / BAA)
+ */
+export async function syncClassesAndStudentsBySemester(user) {
+  const [users, tas, classesList, mks] = await Promise.all([
+    getLocal(STORAGE_KEYS.USERS, INITIAL_USERS),
+    getLocal(STORAGE_KEYS.TA, INITIAL_TA),
+    getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES),
+    getLocal(STORAGE_KEYS.MK, INITIAL_MK)
+  ]);
+
+  const activeTa = tas.find(t => t.isActive) || tas[0];
+  if (!activeTa) {
+    return { success: false, message: "Tidak ada semester aktif BAA", totalSyncCount: 0 };
+  }
+
+  const students = users.filter(u => (u.role || '').toUpperCase() === 'MAHASISWA' && u.isActive !== false);
+
+  // Pastikan seluruh data mahasiswa memiliki semester yang sinkron
+  let usersChanged = false;
+  students.forEach(st => {
+    const standing = calculateAcademicStanding(st.nim, st.angkatan, activeTa);
+    if (standing && standing.semester && Number(st.semester) !== standing.semester) {
+      st.semester = standing.semester;
+      usersChanged = true;
+    }
+  });
+
+  if (usersChanged) {
+    await setLocal(STORAGE_KEYS.USERS, users);
+  }
+
+  let totalSyncCount = 0;
+  let classChanges = false;
+  const updatedClasses = classesList.map(cls => {
+    // Kelas tanpa tahunAkademikId dianggap aktif (toleran terhadap data lama)
+    const isTaMatch = !cls.tahunAkademikId || 
+                      cls.tahunAkademikId === activeTa.id || 
+                      cls.namaTa === activeTa.namaTa;
+    const mk = mks.find(m => String(m.id) === String(cls.mataKuliahId) || m.kodeMk === cls.kodeMk);
+    const courseSemester = Number(cls.semester || mk?.semesterDefault || 1);
+
+    if (cls.semester !== courseSemester) {
+      cls.semester = courseSemester;
+      classChanges = true;
+    }
+    if (!cls.tahunAkademikId) {
+      cls.tahunAkademikId = activeTa.id;
+      cls.namaTa = activeTa.namaTa;
+      classChanges = true;
+    }
+
+    if (!Array.isArray(cls.meetings) || cls.meetings.length === 0) {
+      cls.meetings = generateDefault16Meetings(cls.namaMk || 'Mata Kuliah');
+      classChanges = true;
+    }
+
+    if (!isTaMatch || cls.status === 'CLOSED') return cls;
+    if (!mk) return cls;
+
+    if (!Array.isArray(cls.enrolledStudents)) {
+      cls.enrolledStudents = [];
+    }
+
+    students.forEach(st => {
+      const standing = calculateAcademicStanding(st.nim, st.angkatan, activeTa);
+      const stSemester = standing.semester || Number(st.semester) || 1;
+      const isProdiMatch = !mk.prodiId || !st.prodiId || mk.prodiId === st.prodiId;
+      const stUid = String(st.uid || st.id);
+
+      // Pastikan mahasiswa semester X hanya masuk ke kelas semester X
+      if (stSemester === courseSemester && isProdiMatch) {
+        if (!cls.enrolledStudents.includes(stUid)) {
+          cls.enrolledStudents.push(stUid);
+          totalSyncCount++;
+          classChanges = true;
+        }
+      }
+    });
+
+    return cls;
+  });
+
+  if (totalSyncCount > 0 || classChanges) {
+    await setLocal(STORAGE_KEYS.CLASSES, updatedClasses);
+    // Push update ke koleksi Firestore kelas_kuliah
+    if (isRealFirebaseConfigured() && db) {
+      for (const cls of updatedClasses) {
+        try {
+          const docId = String(cls.uid || cls.id);
+          if (docId) {
+            await setDoc(doc(db, "kelas_kuliah", docId), {
+              enrolledStudents: cls.enrolledStudents || [],
+              semester: cls.semester,
+              tahunAkademikId: cls.tahunAkademikId,
+              namaTa: cls.namaTa,
+              meetings: cls.meetings
+            }, { merge: true });
+          }
+        } catch (e) {
+          console.warn("Sync mass class to Firestore error:", e);
+        }
+      }
+    }
+  }
+
+  if (user) {
+    await logAudit(
+      user, 
+      'SYNC_SEMESTER_CLASSES', 
+      `Sinkronisasi massal data kelas mahasiswa sesuai semester berjalan (${activeTa.namaTa}): ${totalSyncCount} penugasan kelas berhasil diperbarui.`
+    );
+  }
+
+  return {
+    success: true,
+    totalSyncCount,
+    activeSemester: activeTa.namaTa
+  };
+}
+
+export async function updateMeeting(classId, meetingNumber, updateFields, user) {
+  const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+  const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
+  if (!classItem) throw new Error("Kelas tidak ditemukan");
+
+  if (!Array.isArray(classItem.meetings) || classItem.meetings.length === 0) {
+    classItem.meetings = generateDefault16Meetings(classItem.namaMk || 'Mata Kuliah');
+  }
+
+  const meetingIndex = classItem.meetings.findIndex(m => m.pertemuanKe === Number(meetingNumber));
+  if (meetingIndex === -1) throw new Error("Pertemuan tidak ditemukan");
+
+  // Perbarui field meeting secara terstruktur
+  classItem.meetings[meetingIndex] = {
+    ...classItem.meetings[meetingIndex],
+    ...updateFields
+  };
+
+  // Normalisasi boolean flag agar konsisten dan tidak ambigu
+  if (updateFields.isTaskOpen !== undefined) {
+    classItem.meetings[meetingIndex].isTaskOpen = Boolean(updateFields.isTaskOpen);
+  }
+  if (updateFields.isOpen !== undefined) {
+    classItem.meetings[meetingIndex].isOpen = Boolean(updateFields.isOpen);
+  }
+  if (updateFields.hasTask !== undefined) {
+    classItem.meetings[meetingIndex].hasTask = Boolean(updateFields.hasTask);
+  }
+
+  // Simpan konfigurasi pertemuan secara otoritatif ke registri konfigurasi lokal
+  const meetingConfigPayload = {
+    ...updateFields,
+    isTaskOpen: classItem.meetings[meetingIndex].isTaskOpen,
+    isOpen: classItem.meetings[meetingIndex].isOpen,
+    hasTask: classItem.meetings[meetingIndex].hasTask
+  };
+  saveMeetingConfig(classId, meetingNumber, meetingConfigPayload);
+  if (classItem.id && String(classItem.id) !== String(classId)) {
+    saveMeetingConfig(classItem.id, meetingNumber, meetingConfigPayload);
+  }
+  if (classItem.uid && String(classItem.uid) !== String(classId)) {
+    saveMeetingConfig(classItem.uid, meetingNumber, meetingConfigPayload);
+  }
+
+  // Bersihkan key override legacy dari localStorage agar tidak mengaburkan state
+  try {
+    const oKey1 = `STIE_LMS_MEETING_${classItem.id}_${meetingNumber}`;
+    const oKey2 = `STIE_LMS_MEETING_${classId}_${meetingNumber}`;
+    localStorage.removeItem(oKey1);
+    localStorage.removeItem(oKey2);
+    if (classItem.uid) {
+      localStorage.removeItem(`STIE_LMS_MEETING_${classItem.uid}_${meetingNumber}`);
+    }
+  } catch (e) {}
+
+  // Simpan data kelas secara terintegrasi ke localStorage
+  await setLocal(STORAGE_KEYS.CLASSES, list);
+
+  // Sinkronisasi field meetings ke Firestore
+  await syncClassMeetingsToFirestore(classItem);
+
+  await logAudit(user, 'UPDATE_MEETING', `Memperbarui Pertemuan ${meetingNumber} kelas ${classItem.namaMk}`);
+  return classItem.meetings[meetingIndex];
+}
+
+/* =========================================================================
+   4. BAHAN AJAR & VIDEO MEDIA (FR-04)
+   ========================================================================= */
+export async function addMeetingMaterial(classId, meetingNumber, materialData, user) {
+  const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+  const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
+  if (!classItem) throw new Error("Kelas tidak ditemukan");
+
+  if (!Array.isArray(classItem.meetings) || classItem.meetings.length === 0) {
+    classItem.meetings = generateDefault16Meetings(classItem.namaMk || 'Mata Kuliah');
+  }
+
+  const meeting = classItem.meetings.find(m => m.pertemuanKe === Number(meetingNumber));
+  if (!meeting) throw new Error("Pertemuan tidak ditemukan");
+
+  if (!meeting.materials) meeting.materials = [];
+  const newMaterial = {
+    id: `mat-${Date.now()}`,
+    ...materialData,
+    uploadedAt: new Date().toISOString()
+  };
+  meeting.materials.push(newMaterial);
+
+  await setLocal(STORAGE_KEYS.CLASSES, list);
+  await syncClassMeetingsToFirestore(classItem);
+  await logAudit(user, 'UPLOAD_MATERIAL', `Sematkan materi "${newMaterial.judul}" pada Pertemuan ${meetingNumber} kelas ${classItem.namaMk}`);
+  return newMaterial;
+}
+
+export async function deleteMeetingMaterial(classId, meetingNumber, materialId, user) {
+  const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+  const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
+  if (!classItem) throw new Error("Kelas tidak ditemukan");
+
+  if (!Array.isArray(classItem.meetings) || classItem.meetings.length === 0) {
+    classItem.meetings = generateDefault16Meetings(classItem.namaMk || 'Mata Kuliah');
+  }
+
+  const meeting = classItem.meetings.find(m => m.pertemuanKe === Number(meetingNumber));
+  if (!meeting) throw new Error("Pertemuan tidak ditemukan");
+
+  meeting.materials = (meeting.materials || []).filter(m => m.id !== materialId);
+
+  await setLocal(STORAGE_KEYS.CLASSES, list);
+  await syncClassMeetingsToFirestore(classItem);
+  await logAudit(user, 'DELETE_MATERIAL', `Menghapus materi ID ${materialId} pada Pertemuan ${meetingNumber} kelas ${classItem.namaMk}`);
+  return true;
+}
+
+/* =========================================================================
+   5. PRESENSI PERTEMUAN (FR-05)
+   ========================================================================= */
+export async function saveMeetingAttendance(classId, meetingNumber, attendances, user) {
+  const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+  const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
+  if (!classItem) throw new Error("Kelas tidak ditemukan");
+
+  if (!Array.isArray(classItem.meetings) || classItem.meetings.length === 0) {
+    classItem.meetings = generateDefault16Meetings(classItem.namaMk || 'Mata Kuliah');
+  }
+
+  const meeting = classItem.meetings.find(m => m.pertemuanKe === Number(meetingNumber));
+  if (!meeting) throw new Error("Pertemuan tidak ditemukan");
+
+  meeting.attendances = attendances;
+  await setLocal(STORAGE_KEYS.CLASSES, list);
+  await syncClassMeetingsToFirestore(classItem);
+  await logAudit(user, 'INPUT_ATTENDANCE', `Input presensi pertemuan ${meetingNumber} kelas ${classItem.namaMk}`);
+  return attendances;
+}
+
+/* =========================================================================
+   6. PENGUMPULAN TUGAS & PENILAIAN (FR-06)
+   ========================================================================= */
+export async function submitAssignment(classId, meetingNumber, submissionData, user) {
+  const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+  const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
+  if (!classItem) throw new Error("Kelas tidak ditemukan");
+
+  if (!Array.isArray(classItem.meetings) || classItem.meetings.length === 0) {
+    classItem.meetings = generateDefault16Meetings(classItem.namaMk || 'Mata Kuliah');
+  }
+
+  const meeting = classItem.meetings.find(m => m.pertemuanKe === Number(meetingNumber));
+  if (!meeting) throw new Error("Pertemuan tidak ditemukan");
+
+  // Validasi jika sesi pertemuan sedang ditutup oleh dosen
+  if (meeting.isOpen === false) {
+    throw new Error("Sesi pertemuan ini sedang ditutup oleh Dosen Pengampu. Mahasiswa tidak dapat mengumpulkan tugas saat sesi ditutup.");
+  }
+
+  // Validasi jika pengumpulan tugas pada pertemuan ini telah ditutup oleh dosen
+  if (meeting.isTaskOpen === false) {
+    throw new Error("Pengumpulan tugas untuk pertemuan ini telah ditutup oleh Dosen Pengampu.");
+  }
+
+  // Cek apakah pengumpulan melewati batas waktu (deadline) yang ditentukan oleh dosen
+  let isLate = false;
+  if (meeting.taskDeadline) {
+    const deadlineDate = new Date(meeting.taskDeadline);
+    if (!isNaN(deadlineDate.getTime()) && Date.now() > deadlineDate.getTime()) {
+      isLate = true;
+    }
+  }
+
+  const uid = user.uid || user.id;
+  if (!meeting.submissions) meeting.submissions = {};
+  meeting.submissions[uid] = {
+    ...submissionData,
+    mahasiswaId: uid,
+    mahasiswaName: user.name || user.email || 'Mahasiswa',
+    nim: user.nim || user.username || '-',
+    isLate: isLate || Boolean(submissionData.isLate),
+    submittedAt: new Date().toISOString()
+  };
+
+  await setLocal(STORAGE_KEYS.CLASSES, list);
+  await syncClassMeetingsToFirestore(classItem);
+  const auditSuffix = isLate ? ' (Status: TERLAMBAT)' : '';
+  await logAudit(user, 'SUBMIT_TASK', `Mahasiswa ${user.name || user.email} mengumpulkan tugas Pertemuan ${meetingNumber}${auditSuffix}`);
+  return meeting.submissions[uid];
+}
+
+export async function gradeSubmission(classId, meetingNumber, mhsId, nilai, feedback, user) {
+  const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+  const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
+  if (!classItem) throw new Error("Kelas tidak ditemukan");
+
+  if (!Array.isArray(classItem.meetings) || classItem.meetings.length === 0) {
+    classItem.meetings = generateDefault16Meetings(classItem.namaMk || 'Mata Kuliah');
+  }
+
+  const meeting = classItem.meetings.find(m => m.pertemuanKe === Number(meetingNumber));
+  if (!meeting || !meeting.submissions || !meeting.submissions[mhsId]) {
+    throw new Error("Pengumpulan tugas tidak ditemukan");
+  }
+
+  meeting.submissions[mhsId].nilai = Number(nilai);
+  meeting.submissions[mhsId].catatanDosen = feedback;
+  meeting.submissions[mhsId].gradedAt = new Date().toISOString();
+
+  await setLocal(STORAGE_KEYS.CLASSES, list);
+  await syncClassMeetingsToFirestore(classItem);
+  await logAudit(user, 'GRADE_TASK', `Memberikan nilai ${nilai} untuk tugas mahasiswa ${mhsId} pertemuan ${meetingNumber}`);
+  return meeting.submissions[mhsId];
+}
+
+/* =========================================================================
+   7. BUKU NILAI OTOMATIS (GRADEBOOK) (FR-07)
+   ========================================================================= */
+export async function updateStudentGrade(classId, mhsId, scores, user) {
+  const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+  const classItem = list.find(c => c.id === classId);
+  if (!classItem) throw new Error("Kelas tidak ditemukan");
+
+  const overrideGrade = scores.overrideGrade || (scores.isOverridden ? scores.nilaiHuruf : null);
+
+  const calculated = calculateFinalGrade(
+    scores.nilaiTugas,
+    scores.nilaiKuis,
+    scores.nilaiUts,
+    scores.nilaiUas,
+    overrideGrade
+  );
+
+  const usersList = await getLocal(STORAGE_KEYS.USERS, INITIAL_USERS);
+  const mhs = usersList.find(u => u.uid === mhsId) || {};
+
+  classItem.grades[mhsId] = {
+    mhsId,
+    nama: mhs.name || 'Mahasiswa',
+    nim: mhs.nim || mhs.username || '-',
+    ...calculated
+  };
+
+  await setLocal(STORAGE_KEYS.CLASSES, list);
+
+  // Sync nilai mahasiswa ke Firestore agar sinkron di semua browser
+  if (isRealFirebaseConfigured() && db) {
+    try {
+      const docId = String(classItem.uid || classItem.id);
+      await setDoc(doc(db, "kelas_kuliah", docId), {
+        grades: classItem.grades
+      }, { merge: true });
+    } catch (e) {
+      console.warn("Firestore updateStudentGrade sync error:", e);
+    }
+  }
+  await logAudit(user, 'UPDATE_GRADE', `Memperbarui nilai akhir OBE mahasiswa ${mhs.name || mhsId} di kelas ${classItem.namaMk}: ${calculated.gradeLabel || calculated.nilaiHuruf}`);
+  return classItem.grades[mhsId];
+}
+
+/* =========================================================================
+   8. LAPORAN SKOR KEAKTIFAN DOSEN (FR-08.1)
+   Skor = (Total Materi * 2) + (Total Presensi * 1) + (Total Tugas Dinilai * 3)
+   ========================================================================= */
+export async function calculateLecturersActivityScores() {
+  const users = await getLocal(STORAGE_KEYS.USERS, INITIAL_USERS);
+  const lecturers = users.filter(u => u.role === 'DOSEN');
+  const classes = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+
+  return lecturers.map(dosen => {
+    const dosenClasses = classes.filter(c => isClassAssignedToLecturer(c, dosen));
+    let totalMateri = 0;
+    let totalPresensi = 0;
+    let totalTugasDinilai = 0;
+
+    dosenClasses.forEach(cls => {
+      (cls.meetings || []).forEach(m => {
+        totalMateri += (m.materials || []).length;
+        if (m.attendances && Object.keys(m.attendances).length > 0) {
+          totalPresensi += 1;
+        }
+        if (m.submissions) {
+          Object.values(m.submissions).forEach(sub => {
+            if (sub.nilai !== undefined && sub.nilai !== null) {
+              totalTugasDinilai += 1;
+            }
+          });
+        }
+      });
+    });
+
+    const score = (totalMateri * 2) + (totalPresensi * 1) + (totalTugasDinilai * 3);
+
+    return {
+      dosenId: dosen.uid,
+      namaDosen: dosen.name,
+      nidn: dosen.nidn || '-',
+      email: dosen.email,
+      totalKelas: dosenClasses.length,
+      totalMateri,
+      totalPresensi,
+      totalTugasDinilai,
+      totalScore: score
+    };
+  });
+}
+
+/* =========================================================================
+   9. ATUR MEDIA PERKULIAHAN DARING PER PERTEMUAN
+   ========================================================================= */
+export async function updateMeetingMedia(classId, meetingNumber, mediaData, user) {
+  const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+  const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
+  if (!classItem) throw new Error("Kelas tidak ditemukan");
+
+  if (!Array.isArray(classItem.meetings) || classItem.meetings.length === 0) {
+    classItem.meetings = generateDefault16Meetings(classItem.namaMk || 'Mata Kuliah');
+  }
+
+  const meeting = classItem.meetings.find(m => m.pertemuanKe === Number(meetingNumber));
+  if (!meeting) throw new Error("Pertemuan tidak ditemukan");
+
+  meeting.videoType = mediaData.videoType; // 'GOOGLE_MEET' | 'ZOOM' | 'YOUTUBE' | 'MP4'
+  meeting.videoUrl = mediaData.videoUrl || '';
+  meeting.zoomMeetingUrl = mediaData.zoomMeetingUrl || '';
+  meeting.googleMeetUrl = mediaData.googleMeetUrl || '';
+  meeting.mediaTitle = mediaData.mediaTitle || '';
+
+  await setLocal(STORAGE_KEYS.CLASSES, list);
+  await syncClassMeetingsToFirestore(classItem);
+  await logAudit(user, 'UPDATE_MEDIA', `Mengatur tautan media daring (${mediaData.videoType}) pada Pertemuan ${meetingNumber} kelas ${classItem.namaMk}`);
+  return meeting;
+}
+
+/* =========================================================================
+   10. SINKRONISASI DATABASE CLOUD FIRESTORE LANGSUNG (SUPER ADMIN)
+   ========================================================================= */
+export async function syncCollectionsToLiveFirestore(onProgress) {
+  if (!db) {
+    throw new Error("Objek database Firestore belum terinisialisasi. Periksa kredensial Firebase Anda.");
+  }
+
+  const batch = writeBatch(db);
+  const logs = [];
+
+  const updateStatus = (msg) => {
+    logs.push(msg);
+    if (onProgress) onProgress(msg, logs);
+  };
+
+  updateStatus("Memulai proses sinkronisasi koleksi ke Cloud Firestore...");
+
+  // 1. Users
+  const users = await getLocal(STORAGE_KEYS.USERS, INITIAL_USERS);
+  for (const u of users) {
+    const userRef = doc(db, "users", u.uid);
+    batch.set(userRef, {
+      uid: u.uid,
+      name: u.name,
+      email: u.email,
+      role: u.role,
+      username: u.username || '',
+      nim: u.nim || '',
+      nidn: u.nidn || '',
+      isActive: u.isActive !== false,
+      createdAt: serverTimestamp()
+    }, { merge: true });
+  }
+  updateStatus(`Menyiapkan ${users.length} dokumen koleksi 'users'...`);
+
+  // 2. Tahun Akademik
+  const tas = await getLocal(STORAGE_KEYS.TA, INITIAL_TA);
+  for (const t of tas) {
+    const taRef = doc(db, "tahun_akademik", t.id);
+    batch.set(taRef, t, { merge: true });
+  }
+  updateStatus(`Menyiapkan ${tas.length} dokumen koleksi 'tahun_akademik'...`);
+
+  // 3. Prodi
+  const prodis = await getLocal(STORAGE_KEYS.PRODI, INITIAL_PRODI);
+  for (const p of prodis) {
+    const prodiRef = doc(db, "prodi", p.id);
+    batch.set(prodiRef, p, { merge: true });
+  }
+  updateStatus(`Menyiapkan ${prodis.length} dokumen koleksi 'prodi'...`);
+
+  // 4. Mata Kuliah
+  const mks = await getLocal(STORAGE_KEYS.MK, INITIAL_MK);
+  for (const m of mks) {
+    const mkRef = doc(db, "mata_kuliah", m.id);
+    batch.set(mkRef, m, { merge: true });
+  }
+  updateStatus(`Menyiapkan ${mks.length} dokumen koleksi 'mata_kuliah'...`);
+
+  // 5. Kelas Kuliah
+  const classes = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+  for (const c of classes) {
+    const classRef = doc(db, "kelas_kuliah", c.id);
+    batch.set(classRef, {
+      id: c.id,
+      mataKuliahId: c.mataKuliahId,
+      namaMk: c.namaMk,
+      kodeMk: c.kodeMk,
+      sks: c.sks,
+      namaKelas: c.namaKelas,
+      dosenId: c.dosenId,
+      namaDosen: c.namaDosen,
+      kuota: c.kuota || 40,
+      status: c.status || 'OPEN',
+      hari: c.hari || 'Senin',
+      jam: c.jam || '08:00 WITA',
+      ruang: c.ruang || 'Lab',
+      enrolledStudents: c.enrolledStudents || [],
+    }, { merge: true });
+  }
+  updateStatus(`Menyiapkan ${classes.length} dokumen koleksi 'kelas_kuliah' beserta 16 pertemuan...`);
+
+  // Eksekusi Batch Commit
+  await batch.commit();
+  updateStatus("✅ Commit batch ke Cloud Firestore BERHASIL! Seluruh koleksi dan data tersinkronisasi.");
+  return { success: true };
+}
+
+/* =========================================================================
+   10. FITUR PESAN & DISKUSI PERKULIAHAN (CLASS MESSAGING & NOTIFICATIONS)
+   ========================================================================= */
+
+const CLASS_MESSAGES_KEY_PREFIX = 'STIE_LMS_CLASS_MESSAGES_';
+
+/**
+ * Mengambil seluruh pesan kelas perkuliahan.
+ * Menggabungkan classItem.messages, Firestore (jika live), dan localStorage
+ * untuk memastikan sinkronisasi dua arah real-time antara Dosen dan Mahasiswa.
+ */
+export async function getClassMessages(classId) {
+  if (!classId) return [];
+  const key = `${CLASS_MESSAGES_KEY_PREFIX}${classId}`;
+
+  const messageMap = new Map();
+
+  /**
+   * Helper merge: Selalu prioritaskan versi yang lebih baru atau yang sudah dihapus.
+   * Versi dengan isDeleted:true SELALU menang atas versi tanpa isDeleted,
+   * karena tindakan hapus adalah aksi eksplisit user yang harus diprioritaskan.
+   */
+  const mergeMessage = (existing, incoming) => {
+    if (!existing) return incoming;
+    // Jika salah satu versi sudah dihapus, prioritaskan yang dihapus
+    if (incoming.isDeleted && !existing.isDeleted) return incoming;
+    if (existing.isDeleted && !incoming.isDeleted) return existing;
+    // Jika keduanya sama-sama dihapus atau sama-sama tidak dihapus, pilih yang terbaru
+    const existingTime = new Date(existing.deletedAt || existing.updatedAt || existing.createdAt || 0).getTime();
+    const incomingTime = new Date(incoming.deletedAt || incoming.updatedAt || incoming.createdAt || 0).getTime();
+    return incomingTime >= existingTime ? incoming : existing;
+  };
+
+  // 1. Ambil dari Firestore (sumber utama, prioritas terendah dalam merge)
+  if (isRealFirebaseConfigured() && db) {
+    try {
+      const classDocRef = doc(db, "kelas_kuliah", classId);
+      const classDocSnap = await getDoc(classDocRef);
+      if (classDocSnap.exists()) {
+        const data = classDocSnap.data();
+        if (Array.isArray(data.messages)) {
+          data.messages.forEach(m => {
+            if (m && m.id) messageMap.set(m.id, mergeMessage(messageMap.get(m.id), m));
+          });
+        }
+      }
+
+      // Periksa juga subkoleksi 'pesan_diskusi' jika ada pesan yang tersimpan di subkoleksi
+      try {
+        const subSnap = await getDocs(collection(db, "kelas_kuliah", classId, "pesan_diskusi"));
+        if (!subSnap.empty) {
+          subSnap.docs.forEach(d => {
+            const m = d.data();
+            const msgId = m.id || d.id;
+            if (msgId) {
+              const msgWithId = { ...m, id: msgId };
+              messageMap.set(msgId, mergeMessage(messageMap.get(msgId), msgWithId));
+            }
+          });
+        }
+      } catch (subErr) {
+        // subcollection query optional
+      }
+    } catch (fbErr) {
+      console.warn("Firestore getClassMessages warning:", fbErr);
+    }
+  }
+
+  // 2. Ambil dari classItem di STORAGE_KEYS.CLASSES (override Firestore)
+  try {
+    const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+    const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
+    if (classItem && Array.isArray(classItem.messages)) {
+      classItem.messages.forEach(m => {
+        if (m && m.id) messageMap.set(m.id, mergeMessage(messageMap.get(m.id), m));
+      });
+    }
+  } catch (err) {
+    console.warn("Gagal mengambil pesan dari classItem:", err);
+  }
+
+  // 3. Gabungkan dengan localStorage cache (PRIORITAS TERTINGGI — mencerminkan aksi terbaru user)
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw) {
+      const localMsgs = JSON.parse(raw);
+      if (Array.isArray(localMsgs)) {
+        localMsgs.forEach(m => {
+          if (m && m.id) {
+            // localStorage selalu override sumber lain karena mencerminkan aksi terbaru
+            messageMap.set(m.id, mergeMessage(messageMap.get(m.id), m));
+          }
+        });
+      }
+    }
+  } catch (lsErr) {
+    console.warn("localStorage message read error:", lsErr);
+  }
+
+  const merged = Array.from(messageMap.values());
+  // Urutkan berdasarkan createdAt ASC
+  merged.sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0));
+
+  // Cache kembali ke localStorage
+  try {
+    localStorage.setItem(key, JSON.stringify(merged));
+  } catch (e) {}
+
+  return merged;
+}
+
+/**
+ * Mengirim pesan kelas baru.
+ * Disimpan ke classItem.messages di STORAGE_KEYS.CLASSES, ke Firestore,
+ * dan memicu event sinkronisasi data real-time.
+ */
+export async function sendClassMessage(classId, messageData, user) {
+  if (!classId || !messageData?.text?.trim() || !user) return null;
+  const key = `${CLASS_MESSAGES_KEY_PREFIX}${classId}`;
+
+  const currentUserId = user.uid || user.id;
+  const newMessage = {
+    id: `msg-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
+    classId,
+    senderId: currentUserId,
+    senderEmail: user.email || '',
+    senderName: user.name || user.email || 'Pengguna',
+    senderRole: user.role || 'MAHASISWA', // 'DOSEN', 'MAHASISWA', 'ADMIN_AKADEMIK', 'SUPER_ADMIN'
+    senderAvatar: user.avatarUrl || null,
+    text: messageData.text.trim(),
+    createdAt: new Date().toISOString(),
+    readBy: [currentUserId]
+  };
+
+  // 1. Ambil daftar pesan yang ada
+  const existing = await getClassMessages(classId);
+  const updatedMessages = [...existing, newMessage];
+
+  // 2. Simpan ke classItem di STORAGE_KEYS.CLASSES
+  try {
+    const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+    const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
+    if (classItem) {
+      classItem.messages = updatedMessages;
+      await setLocal(STORAGE_KEYS.CLASSES, list);
+    }
+  } catch (err) {
+    console.warn("Gagal mengupdate pesan ke classItem:", err);
+  }
+
+  // 3. Simpan ke key khusus localStorage
+  try {
+    localStorage.setItem(key, JSON.stringify(updatedMessages));
+  } catch (e) {}
+
+  // 4. Jika real Firebase live, simpan ke Firestore
+  if (isRealFirebaseConfigured() && db) {
+    try {
+      await updateDoc(doc(db, "kelas_kuliah", classId), {
+        messages: updatedMessages
+      }).catch(async () => {
+        await setDoc(doc(db, "kelas_kuliah", classId), { messages: updatedMessages }, { merge: true });
+      });
+
+      await addDoc(collection(db, "kelas_kuliah", classId, "pesan_diskusi"), {
+        ...newMessage,
+        serverTimestamp: new Date().toISOString()
+      }).catch(() => {});
+    } catch (e) {
+      console.warn("Firestore sendClassMessage warning:", e);
+    }
+  }
+
+  // 5. Emit event sinkronisasi
+  notifyDataChange(key, updatedMessages);
+  notifyDataChange(`STIE_LMS_CLASS_MESSAGES_${classId}`, updatedMessages);
+  notifyDataChange('STIE_LMS_NEW_MESSAGE_NOTIFICATION', { classId, newMessage });
+
+  return newMessage;
+}
+
+/**
+ * Menandai pesan dalam suatu kelas sebagai telah dibaca oleh pengguna
+ */
+export async function markClassMessagesAsRead(classId, userId) {
+  if (!classId || !userId) return;
+  const key = `${CLASS_MESSAGES_KEY_PREFIX}${classId}`;
+  const existing = await getClassMessages(classId);
+  let hasChange = false;
+
+  const updatedMessages = existing.map(msg => {
+    if (!Array.isArray(msg.readBy)) msg.readBy = [];
+    if (!msg.readBy.includes(userId)) {
+      hasChange = true;
+      return { ...msg, readBy: [...msg.readBy, userId] };
+    }
+    return msg;
+  });
+
+  if (hasChange) {
+    try {
+      localStorage.setItem(key, JSON.stringify(updatedMessages));
+    } catch (e) {}
+
+    try {
+      const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+      const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
+      if (classItem) {
+        classItem.messages = updatedMessages;
+        await setLocal(STORAGE_KEYS.CLASSES, list);
+      }
+    } catch (err) {}
+
+    if (isRealFirebaseConfigured() && db) {
+      try {
+        await updateDoc(doc(db, "kelas_kuliah", classId), {
+          messages: updatedMessages
+        }).catch(async () => {
+          await setDoc(doc(db, "kelas_kuliah", classId), { messages: updatedMessages }, { merge: true });
+        });
+      } catch (e) {}
+    }
+
+    notifyDataChange(key, updatedMessages);
+    notifyDataChange('STIE_LMS_NEW_MESSAGE_NOTIFICATION', { classId, markedReadBy: userId });
+  }
+}
+
+/**
+ * Edit isi teks pesan kelas (hanya bisa dilakukan oleh pengirim asli)
+ */
+export async function editClassMessage(classId, messageId, newText, user) {
+  if (!classId || !messageId || !newText?.trim() || !user) return null;
+  const key = `${CLASS_MESSAGES_KEY_PREFIX}${classId}`;
+  const existing = await getClassMessages(classId);
+  const userId = user.uid || user.id;
+
+  const updatedMessages = existing.map(msg => {
+    if (msg.id === messageId) {
+      // Hanya pengirim asli yang bisa mengedit
+      const isOwner = msg.senderId === userId || 
+                      String(msg.senderId) === String(user.id) || 
+                      String(msg.senderId) === String(user.uid) ||
+                      (user.email && msg.senderEmail === user.email);
+      if (!isOwner) throw new Error('Anda hanya dapat mengedit pesan yang Anda kirimkan sendiri.');
+      return {
+        ...msg,
+        text: newText.trim(),
+        editedAt: new Date().toISOString(),
+        isEdited: true
+      };
+    }
+    return msg;
+  });
+
+  // Hapus salinan pada subkoleksi. Sebelumnya hanya array `messages` yang
+  // diperbarui, sehingga salinan subkoleksi muncul kembali saat pesan dimuat.
+  if (isRealFirebaseConfigured() && db) {
+    const messageDocs = await getDocs(collection(db, "kelas_kuliah", classId, "pesan_diskusi"));
+    const matchingDocs = messageDocs.docs.filter(snapshot =>
+      snapshot.id === String(messageId) || snapshot.data().id === messageId
+    );
+    // Satu batch menjaga array lama dan subkoleksi tetap konsisten lintas perangkat.
+    // Jangan menelan error remote: pengguna perlu tahu bila perubahan gagal disimpan.
+    const batch = writeBatch(db);
+    matchingDocs.forEach(snapshot => batch.delete(snapshot.ref));
+    batch.set(doc(db, "kelas_kuliah", classId), { messages: updatedMessages }, { merge: true });
+    await batch.commit();
+  }
+
+  // Simpan cache lokal sesudah sumber remote berhasil diperbarui.
+  try { localStorage.setItem(key, JSON.stringify(updatedMessages)); } catch (e) {}
+  try {
+    const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+    const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
+    if (classItem) {
+      classItem.messages = updatedMessages;
+      await setLocal(STORAGE_KEYS.CLASSES, list);
+    }
+  } catch (err) {}
+
+  notifyDataChange(key, updatedMessages);
+  notifyDataChange(`STIE_LMS_CLASS_MESSAGES_${classId}`, updatedMessages);
+  return updatedMessages.find(m => m.id === messageId);
+}
+
+/**
+ * Hapus pesan kelas secara permanen (hard delete).
+ * Pesan dihapus fisik dari array, tidak lagi muncul di chat maupun notifikasi.
+ */
+export async function deleteClassMessage(classId, messageId, user) {
+  if (!classId || !messageId || !user) return;
+  const key = `${CLASS_MESSAGES_KEY_PREFIX}${classId}`;
+  const existing = await getClassMessages(classId);
+  const userId = user.uid || user.id;
+  const role = (user.role || '').toUpperCase();
+  const canModerate = ['SUPER_ADMIN', 'ADMIN', 'ADMIN_AKADEMIK', 'BAA', 'DOSEN'].includes(role);
+
+  // Cari pesan yang akan dihapus untuk validasi kepemilikan
+  const targetMsg = existing.find(msg => msg.id === messageId);
+  if (targetMsg) {
+    const isOwner = targetMsg.senderId === userId ||
+                    String(targetMsg.senderId) === String(user.id) ||
+                    String(targetMsg.senderId) === String(user.uid) ||
+                    (user.email && targetMsg.senderEmail === user.email);
+    if (!isOwner && !canModerate) {
+      throw new Error('Anda tidak memiliki wewenang untuk menghapus pesan ini.');
+    }
+  }
+
+  // Hard delete: hapus pesan dari array sepenuhnya
+  const updatedMessages = existing.filter(msg => msg.id !== messageId);
+
+  // Simpan ke localStorage
+  try { localStorage.setItem(key, JSON.stringify(updatedMessages)); } catch (e) {}
+
+  // Update ke classItem
+  try {
+    const list = await getLocal(STORAGE_KEYS.CLASSES, INITIAL_CLASSES);
+    const classItem = list.find(c => String(c.id) === String(classId) || String(c.uid || '') === String(classId));
+    if (classItem) {
+      classItem.messages = updatedMessages;
+      await setLocal(STORAGE_KEYS.CLASSES, list);
+    }
+  } catch (err) {}
+
+  // Update ke Firestore
+  if (isRealFirebaseConfigured() && db) {
+    try {
+      await updateDoc(doc(db, "kelas_kuliah", classId), { messages: updatedMessages })
+        .catch(async () => setDoc(doc(db, "kelas_kuliah", classId), { messages: updatedMessages }, { merge: true }));
+    } catch (e) {}
+  }
+
+  notifyDataChange(key, updatedMessages);
+  notifyDataChange(`STIE_LMS_CLASS_MESSAGES_${classId}`, updatedMessages);
+}
+
+/**
+ * Mengambil ringkasan notifikasi pesan masuk yang belum dibaca untuk Pengguna (Dosen & Mahasiswa)
+ */
+export async function getUserClassNotifications(user, classesList = []) {
+  if (!user || !classesList || classesList.length === 0) return { unreadCount: 0, notifications: [] };
+  const userId = user.uid || user.id;
+
+  // Filter kelas di mana user terdaftar (Mahasiswa: enrolled, Dosen: pengampu/assigned)
+  const myClasses = classesList.filter(cls => {
+    if (user.role === 'MAHASISWA') {
+      return (cls.enrolledStudents || []).includes(userId);
+    }
+    if (user.role === 'DOSEN') {
+      return isClassAssignedToLecturer(cls, user);
+    }
+    return true;
+  });
+
+  let allNotifications = [];
+
+  for (const cls of myClasses) {
+    const messageMap = new Map();
+
+    // 1. Dari cls.messages
+    if (Array.isArray(cls.messages)) {
+      cls.messages.forEach(m => {
+        if (m && m.id) messageMap.set(m.id, m);
+      });
+    }
+
+    // 2. Dari localStorage
+    const key = `${CLASS_MESSAGES_KEY_PREFIX}${cls.id}`;
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw) {
+        const localMsgs = JSON.parse(raw);
+        if (Array.isArray(localMsgs)) {
+          localMsgs.forEach(m => {
+            if (m && m.id && !messageMap.has(m.id)) {
+              messageMap.set(m.id, m);
+            }
+          });
+        }
+      }
+    } catch(e) {}
+
+    messageMap.forEach(m => {
+      // Hanya tampilkan notifikasi untuk pesan yang belum dihapus
+      if (m.isDeleted) return;
+      const isUnread = m.senderId !== userId && !(m.readBy || []).includes(userId);
+      allNotifications.push({
+        id: m.id,
+        classId: cls.id,
+        namaMk: cls.namaMk,
+        kodeMk: cls.kodeMk,
+        namaKelas: cls.namaKelas || 'A',
+        senderName: m.senderName,
+        senderRole: m.senderRole,
+        senderAvatar: m.senderAvatar,
+        text: m.text,
+        createdAt: m.createdAt,
+        isUnread
+      });
+    });
+  }
+
+  // Urutkan notifikasi dari yang paling baru
+  allNotifications.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  const unreadCount = allNotifications.filter(n => n.isUnread).length;
+
+  return {
+    unreadCount,
+    notifications: allNotifications.slice(0, 15)
+  };
+}

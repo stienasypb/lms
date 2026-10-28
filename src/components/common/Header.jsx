@@ -1,0 +1,287 @@
+import React, { useState, useEffect } from 'react';
+import { useAuth } from '../../context/AuthContext';
+import { 
+  LogOut, 
+  ShieldCheck, 
+  GraduationCap, 
+  UserCheck, 
+  Database, 
+  Settings, 
+  Bell, 
+  Sparkles,
+  Menu,
+  MessageSquare
+} from 'lucide-react';
+import FirebaseSettingsModal from './FirebaseSettingsModal';
+import ProfileModal from './ProfileModal';
+import { 
+  getClasses, 
+  getUserClassNotifications, 
+  subscribeToDataSync 
+} from '../../firebase/firestoreService';
+
+export default function Header({ onToggleSidebar, onNavigate }) {
+  const { user, logout, isFirebaseLive } = useAuth();
+  const [showConfigModal, setShowConfigModal] = useState(false);
+  const [showProfileModal, setShowProfileModal] = useState(false);
+
+  // Notifikasi Pesan Masuk Kelas untuk Dosen & Mahasiswa
+  const [notificationsData, setNotificationsData] = useState({ unreadCount: 0, notifications: [] });
+  const [showNotificationsDropdown, setShowNotificationsDropdown] = useState(false);
+
+  const fetchNotifications = async () => {
+    if (!user) return;
+    try {
+      const cls = await getClasses();
+      const res = await getUserClassNotifications(user, cls);
+      setNotificationsData(res);
+    } catch (err) {
+      console.error("Error fetching notifications:", err);
+    }
+  };
+
+  useEffect(() => {
+    fetchNotifications();
+    const pollInterval = setInterval(() => {
+      fetchNotifications();
+    }, 8000); // Polling otomatis setiap 8 detik
+
+    const unsubscribe = subscribeToDataSync((detail) => {
+      if (detail && detail.key === 'STIE_LMS_LOGS') return;
+      fetchNotifications();
+    });
+    return () => {
+      clearInterval(pollInterval);
+      unsubscribe();
+    };
+  }, [user]);
+
+  const handleOpenNotification = (notif) => {
+    setShowNotificationsDropdown(false);
+    if (onNavigate) {
+      onNavigate('classes', { selectedClassId: notif.classId, initialTab: 'MESSAGES' });
+    }
+  };
+
+  const getRoleBadge = (role) => {
+    switch (role) {
+      case 'SUPER_ADMIN':
+        return <span className="bg-purple-100 text-purple-800 text-xs font-semibold px-2 py-0.5 rounded-full border border-purple-200">Super Admin</span>;
+      case 'ADMIN_AKADEMIK':
+        return <span className="bg-indigo-100 text-indigo-800 text-xs font-semibold px-2 py-0.5 rounded-full border border-indigo-200">Admin BAA</span>;
+      case 'DOSEN':
+        return <span className="bg-blue-100 text-blue-800 text-xs font-semibold px-2 py-0.5 rounded-full border border-blue-200">Dosen Pengampu</span>;
+      case 'MAHASISWA':
+        return <span className="bg-emerald-100 text-emerald-800 text-xs font-semibold px-2 py-0.5 rounded-full border border-emerald-200">Mahasiswa</span>;
+      default:
+        return null;
+    }
+  };
+
+  return (
+    <>
+      <header className="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-sm">
+        <div className="max-w-7xl mx-auto px-3 sm:px-6 lg:px-8">
+          <div className="flex justify-between items-center h-16">
+            
+            {/* Logo, Hamburger & Kampus Branding */}
+            <div className="flex items-center space-x-2 sm:space-x-3">
+              {/* Hamburger Button for Mobile / Tablet Drawer */}
+              <button
+                type="button"
+                onClick={onToggleSidebar}
+                className="lg:hidden p-2 -ml-1 rounded-xl text-slate-700 hover:text-brand-900 hover:bg-slate-100 transition-colors focus:outline-none focus:ring-2 focus:ring-brand-500"
+                aria-label="Buka Menu Navigasi"
+              >
+                <Menu className="w-5 h-5" />
+              </button>
+
+              <img 
+                src={`${import.meta.env.BASE_URL}logo-stienas.png`} 
+                alt="Logo STIE Nasional Banjarmasin" 
+                className="w-8 h-8 sm:w-10 sm:h-10 object-contain drop-shadow-sm hover:scale-105 transition-transform" 
+              />
+              <div>
+                <h1 className="text-sm sm:text-base font-bold text-slate-900 tracking-tight flex items-center gap-1 sm:gap-1.5">
+                  LMS STIE NASIONAL
+                  <span className="hidden sm:inline-block text-[10px] bg-brand-50 text-brand-700 px-1.5 py-0.5 rounded border border-brand-200 uppercase font-mono">Banjarmasin</span>
+                </h1>
+                <p className="text-[11px] sm:text-xs text-slate-500 font-medium hidden sm:block">Kurikulum Berbasis Luaran (Outcome-Based Education / OBE)</p>
+              </div>
+            </div>
+
+            {/* Actions & Profile */}
+            <div className="flex items-center space-x-3">
+              {/* Firebase Status Badge - Hanya ditampilkan untuk Super Admin (disembunyikan pada Dosen, BAA, dan Mahasiswa) */}
+              {user?.role === 'SUPER_ADMIN' && (
+                <button 
+                  onClick={() => setShowConfigModal(true)}
+                  title="Klik untuk konfigurasi Firebase Backend"
+                  className={`flex items-center space-x-1.5 text-xs px-2.5 py-1.5 rounded-lg border transition-all ${
+                    isFirebaseLive 
+                      ? 'bg-amber-50 border-amber-300 text-amber-900 hover:bg-amber-100' 
+                      : 'bg-emerald-50 border-emerald-300 text-emerald-900 hover:bg-emerald-100'
+                  }`}
+                >
+                  <Database className="w-3.5 h-3.5 text-amber-600" />
+                  <span className="hidden sm:inline font-medium">
+                    {isFirebaseLive ? 'Firebase BaaS: Live' : 'Firebase: Demo/Config'}
+                  </span>
+                </button>
+              )}
+
+              {/* Notifikasi Pesan Masuk Kelas */}
+              {user && (
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={() => setShowNotificationsDropdown(!showNotificationsDropdown)}
+                    title="Notifikasi Pesan & Diskusi Kelas"
+                    className="relative p-2 text-slate-600 hover:text-brand-900 hover:bg-slate-100 rounded-xl transition-all focus:outline-none"
+                  >
+                    <Bell className="w-5 h-5" />
+                    {notificationsData.unreadCount > 0 && (
+                      <span className="absolute top-1 right-1 min-w-[18px] h-[18px] px-1 bg-rose-600 text-white text-[10px] font-extrabold rounded-full flex items-center justify-center border-2 border-white animate-pulse shadow-sm">
+                        {notificationsData.unreadCount > 9 ? '9+' : notificationsData.unreadCount}
+                      </span>
+                    )}
+                  </button>
+
+                  {/* Popover Dropdown Notifikasi */}
+                  {showNotificationsDropdown && (
+                    <>
+                      <div 
+                        className="fixed inset-0 z-40" 
+                        onClick={() => setShowNotificationsDropdown(false)}
+                      />
+                      <div className="absolute right-0 mt-2 w-80 sm:w-96 bg-white rounded-2xl shadow-2xl border border-slate-200 z-50 overflow-hidden animate-in fade-in zoom-in-95">
+                        <div className="p-3.5 bg-slate-900 text-white flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <Bell className="w-4 h-4 text-gold-400" />
+                            <span className="font-bold text-xs sm:text-sm">Notifikasi Pesan Kelas</span>
+                          </div>
+                          {notificationsData.unreadCount > 0 && (
+                            <span className="text-[10px] font-bold bg-rose-600 px-2 py-0.5 rounded-full text-white">
+                              {notificationsData.unreadCount} Baru
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="max-h-80 overflow-y-auto divide-y divide-slate-100">
+                          {notificationsData.notifications.length === 0 ? (
+                            <div className="p-6 text-center text-slate-400 text-xs">
+                              <MessageSquare className="w-8 h-8 mx-auto mb-2 text-slate-300" />
+                              Tidak ada notifikasi pesan baru saat ini.
+                            </div>
+                          ) : (
+                            notificationsData.notifications.map((notif) => (
+                              <div
+                                key={notif.id}
+                                onClick={() => handleOpenNotification(notif)}
+                                className={`p-3 sm:p-3.5 hover:bg-slate-50 cursor-pointer transition-colors flex items-start gap-2.5 ${
+                                  notif.isUnread ? 'bg-brand-50/60' : 'bg-white'
+                                }`}
+                              >
+                                <div className="shrink-0 mt-0.5">
+                                  {notif.senderAvatar ? (
+                                    <img 
+                                      src={notif.senderAvatar} 
+                                      alt={notif.senderName} 
+                                      className="w-8 h-8 rounded-full object-cover border border-slate-200 shadow-sm"
+                                    />
+                                  ) : (
+                                    <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold text-white shadow-sm ${
+                                      notif.senderRole === 'DOSEN' ? 'bg-blue-800' : 'bg-emerald-800'
+                                    }`}>
+                                      {(notif.senderName || 'U').charAt(0).toUpperCase()}
+                                    </div>
+                                  )}
+                                </div>
+
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex items-center justify-between gap-1">
+                                    <span className="text-xs font-bold text-slate-900 truncate">
+                                      {notif.senderName}
+                                    </span>
+                                    <span className="text-[10px] text-slate-400 shrink-0">
+                                      {new Date(notif.createdAt).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}
+                                    </span>
+                                  </div>
+
+                                  <div className="text-[10px] font-semibold text-brand-800 truncate mt-0.5">
+                                    {notif.namaMk} ({notif.namaKelas})
+                                  </div>
+
+                                  <p className="text-xs text-slate-600 line-clamp-2 mt-0.5 leading-snug">
+                                    {notif.text}
+                                  </p>
+                                </div>
+
+                                {notif.isUnread && (
+                                  <span className="w-2 h-2 rounded-full bg-rose-500 shrink-0 mt-2"></span>
+                                )}
+                              </div>
+                            ))
+                          )}
+                        </div>
+
+                        {notificationsData.notifications.length > 0 && (
+                          <div className="p-2.5 bg-slate-50 border-t border-slate-100 text-center">
+                            <span className="text-[11px] text-slate-500 font-medium">
+                              Klik pesan untuk membuka ruang diskusi kelas
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {/* User Profile */}
+              {user && (
+                <div className="flex items-center space-x-2 pl-2 border-l border-slate-200">
+                  <button 
+                    onClick={() => setShowProfileModal(true)}
+                    title="Klik untuk melihat dan mengedit profil Anda"
+                    className="flex items-center space-x-2.5 p-1 rounded-xl hover:bg-slate-100 transition-colors text-left group"
+                  >
+                    <img 
+                      src={user.avatarUrl || `https://ui-avatars.com/api/?name=${encodeURIComponent(user.name || 'User')}&background=1e3a8a&color=fff`} 
+                      alt={user.name} 
+                      className="w-9 h-9 rounded-full object-cover border border-slate-300 group-hover:border-brand-500 transition-colors"
+                    />
+                    <div className="hidden md:block text-left">
+                      <div className="text-xs font-bold text-slate-800 flex items-center gap-1.5 group-hover:text-brand-900">
+                        {user.name}
+                      </div>
+                      <div>{getRoleBadge(user.role)}</div>
+                    </div>
+                  </button>
+                  <button 
+                    onClick={logout}
+                    title="Keluar (Logout)"
+                    className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors ml-1"
+                  >
+                    <LogOut className="w-4 h-4" />
+                  </button>
+                </div>
+              )}
+            </div>
+
+          </div>
+        </div>
+      </header>
+
+      {/* Firebase Modal */}
+      {showConfigModal && (
+        <FirebaseSettingsModal onClose={() => setShowConfigModal(false)} />
+      )}
+
+      {/* Profile Modal */}
+      {showProfileModal && (
+        <ProfileModal onClose={() => setShowProfileModal(false)} />
+      )}
+    </>
+  );
+}
