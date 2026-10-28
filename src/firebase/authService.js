@@ -1,9 +1,6 @@
-/**
- * Layanan Autentikasi Firebase & Otorisasi Pengguna
- * Sesuai PRD FR-01 (Login, State Persistence, Inactive Account Check)
- */
 import { 
   signInWithEmailAndPassword, 
+  createUserWithEmailAndPassword,
   signOut as firebaseSignOut, 
   onAuthStateChanged,
   sendPasswordResetEmail 
@@ -21,6 +18,83 @@ export function normalizeLoginIdentifier(identifier) {
   }
   // Format NIM / NIDN ke email domain LMS STIE Nasional
   return `${trimmed}@lms.stienas.ac.id`;
+}
+
+export function getLegacyFirebaseEmail(userRecord, fallbackIdentifier = '') {
+  const explicitEmail = (userRecord?.email || '').trim().toLowerCase();
+  if (explicitEmail && explicitEmail.includes('@')) return explicitEmail;
+
+  const candidate = [
+    userRecord?.username,
+    userRecord?.nim,
+    userRecord?.nidn,
+    userRecord?.id,
+    userRecord?.uid,
+    fallbackIdentifier
+  ].find(value => {
+    const normalized = String(value || '').trim();
+    return normalized.length > 0;
+  });
+
+  if (!candidate) return '';
+
+  const cleaned = String(candidate).trim().toLowerCase().replace(/\s+/g, '');
+  return cleaned.includes('@') ? cleaned : `${cleaned}@lms.stienas.ac.id`;
+}
+
+function shouldAutoCreateFirebaseUser(error) {
+  if (!error || typeof error !== 'object') return false;
+  const code = (error.code || '').toString();
+  return code === 'auth/user-not-found' || code === 'auth/invalid-login-credentials';
+}
+
+async function syncLegacyUserToFirebase(userRecord, password, identifier = '') {
+  const targetEmail = getLegacyFirebaseEmail(userRecord, identifier);
+
+  if (!targetEmail || !targetEmail.includes('@')) {
+    throw new Error('Akun lama tidak memiliki alamat email yang valid untuk dibuatkan akun Firebase Authentication.');
+  }
+
+  try {
+    const userCredential = await createUserWithEmailAndPassword(auth, targetEmail, password);
+    const firebaseUser = userCredential.user;
+    const mergedProfile = {
+      ...userRecord,
+      uid: firebaseUser.uid,
+      id: firebaseUser.uid,
+      email: targetEmail,
+      syncedAt: new Date().toISOString()
+    };
+
+    await setDoc(doc(db, 'users', firebaseUser.uid), mergedProfile, { merge: true });
+    localStorage.setItem('STIE_LMS_ACTIVE_USER', JSON.stringify(mergedProfile));
+    recordUserActivity();
+    return mergedProfile;
+  } catch (createErr) {
+    if (createErr?.code === 'auth/email-already-in-use') {
+      const userCredential = await signInWithEmailAndPassword(auth, targetEmail, password);
+      const firebaseUser = userCredential.user;
+      const profileSnap = await getDoc(doc(db, 'users', firebaseUser.uid));
+      const mergedProfile = {
+        ...(profileSnap.exists() ? profileSnap.data() : userRecord),
+        uid: firebaseUser.uid,
+        id: firebaseUser.uid,
+        email: targetEmail,
+        syncedAt: new Date().toISOString()
+      };
+
+      await setDoc(doc(db, 'users', firebaseUser.uid), mergedProfile, { merge: true });
+      localStorage.setItem('STIE_LMS_ACTIVE_USER', JSON.stringify(mergedProfile));
+      recordUserActivity();
+      return mergedProfile;
+    }
+
+    if (createErr?.code === 'auth/wrong-password' || createErr?.code === 'auth/invalid-credential') {
+      throw createErr;
+    }
+
+    throw createErr;
+  }
 }
 
 function describeFirebaseLoginError(error) {
@@ -170,7 +244,8 @@ export async function loginUser(identifier, password) {
         const uEmail = (uData.email || '').toLowerCase().trim();
         const uUser = (uData.username || '').toLowerCase().trim();
         const uNim = String(uData.nim || '').trim().toLowerCase();
-        if (uEmail === trimmed || uUser === trimmed || uNim === trimmed) {
+        const uNidn = String(uData.nidn || '').trim().toLowerCase();
+        if (uEmail === trimmed || uUser === trimmed || uNim === trimmed || uNidn === trimmed) {
           foundUser = uData;
           combinedUsers.push(uData);
           break;
@@ -191,11 +266,12 @@ export async function loginUser(identifier, password) {
     // otorisasi Firestore. Sebelumnya akun lokal selalu langsung dianggap login,
     // sehingga listener Firestore berjalan tanpa request.auth dan mendapat
     // permission-denied.
-    if (isRealFirebaseConfigured() && auth && foundUser.email) {
+    if (isRealFirebaseConfigured() && auth) {
+      const targetEmail = getLegacyFirebaseEmail(foundUser, identifier);
       try {
         const userCredential = await signInWithEmailAndPassword(
           auth,
-          foundUser.email.toLowerCase().trim(),
+          targetEmail,
           rawPass
         );
         const firebaseUser = userCredential.user;
@@ -216,6 +292,21 @@ export async function loginUser(identifier, password) {
         return cloudUser;
       } catch (firebaseError) {
         console.warn('Firebase Auth gagal:', firebaseError.code || firebaseError.message);
+
+        if (firebaseError?.code === 'auth/wrong-password' || firebaseError?.code === 'auth/invalid-credential') {
+          throw new Error(describeFirebaseLoginError(firebaseError));
+        }
+
+        if (shouldAutoCreateFirebaseUser(firebaseError)) {
+          try {
+            const synced = await syncLegacyUserToFirebase(foundUser, rawPass, identifier);
+            return synced;
+          } catch (syncError) {
+            console.warn('Sync legacy user to Firebase failed:', syncError);
+            throw new Error(syncError?.message || describeFirebaseLoginError(syncError));
+          }
+        }
+
         if (firebaseError.message?.includes('profil cloud/role') || firebaseError.message?.includes('berstatus non-aktif')) throw firebaseError;
         throw new Error(describeFirebaseLoginError(firebaseError));
       }
@@ -508,4 +599,3 @@ export async function directResetPassword(identifier, newPassword) {
 }
 
 export { registerStudent } from './firestoreService.js';
-
