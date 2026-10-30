@@ -143,17 +143,29 @@ export default function LoginPage({ onBackToLanding, defaultAuthMode = 'LOGIN' }
     setLoading(true);
     try {
       const targetEmail = resetTarget.email;
-      await directResetPassword(targetEmail, newPasswordForReset);
-      showSuccessAlert(
-        "Kata Sandi Berhasil Diperbarui!", 
-        `Kata sandi baru untuk akun ${resetTarget.name || targetEmail} telah berhasil disimpan. Silakan masuk menggunakan kata sandi baru Anda.`
-      );
-      setIdentifier(targetEmail);
-      setPassword(newPasswordForReset);
-      setResetTarget(null);
-      setNewPasswordForReset('');
-      setConfirmPasswordForReset('');
-      setAuthMode('LOGIN');
+      const res = await directResetPassword(targetEmail, newPasswordForReset);
+      if (res.sentViaFirebase) {
+        // Mode Firebase: kata sandi dikelola Firebase Auth -> kirim tautan reset ke email
+        const msg = `Tautan reset kata sandi telah dikirim ke alamat email terdaftar: ${res.email}. Silakan periksa kotak masuk (Inbox) atau folder Spam, lalu buka tautan untuk menetapkan kata sandi baru Anda.`;
+        setSuccessMessage(msg);
+        showSuccessAlert('Tautan Reset Terkirim', msg);
+        setResetTarget(null);
+        setNewPasswordForReset('');
+        setConfirmPasswordForReset('');
+        setAuthMode('LOGIN');
+        setIdentifier(res.email);
+      } else {
+        showSuccessAlert(
+          "Kata Sandi Berhasil Diperbarui!", 
+          `Kata sandi baru untuk akun ${resetTarget.name || targetEmail} telah berhasil disimpan. Silakan masuk menggunakan kata sandi baru Anda.`
+        );
+        setIdentifier(targetEmail);
+        setPassword(newPasswordForReset);
+        setResetTarget(null);
+        setNewPasswordForReset('');
+        setConfirmPasswordForReset('');
+        setAuthMode('LOGIN');
+      }
     } catch (err) {
       const msg = err.message || "Gagal memperbarui kata sandi.";
       setErrorMessage(msg);

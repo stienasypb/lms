@@ -344,7 +344,7 @@ export default function UserManagementPage() {
       setShowManageModal(false);
       setSelectedUser(null);
       await loadData();
-      showSuccessAlert("Data Diperbarui", `Data akun ${payload.name} berhasil diperbarui!${payload.password ? ' (Kata sandi baru telah diterapkan)' : ''}`);
+      showSuccessAlert("Data Diperbarui", `Data akun ${payload.name} berhasil diperbarui!${payload.password ? ' Kata sandi baru telah dikirim ke email reset (tautan reset akan dikirim ke alamat email akun tersebut).' : ''}`);
     } catch (err) {
       showErrorAlert("Gagal Memperbarui Akun", err.message);
     } finally {

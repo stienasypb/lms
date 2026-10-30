@@ -12,7 +12,7 @@ import {
 import { doc, getDoc, setDoc, updateDoc, collection, getDocs } from "firebase/firestore";
 import { auth, db, isRealFirebaseConfigured } from "./config.js";
 import { INITIAL_USERS } from "../utils/seedData.js";
-import { getUsers, isUserDeleted } from "./firestoreService.js";
+import { getUsers, isUserDeleted, setLocal, STORAGE_KEYS } from "./firestoreService.js";
 
 // Helper konversi username/NIM/NIDN ke email standard jika bukan format email
 export function normalizeLoginIdentifier(identifier) {
@@ -39,6 +39,63 @@ function describeFirebaseLoginError(error) {
     default:
       return 'Login Firebase gagal. Periksa email, kata sandi, dan koneksi akun Firebase Anda.';
   }
+}
+
+/**
+ * Resolve profil LMS dari Firebase Auth user.
+ * Catatan Penting: Firestore koleksi 'users' menyimpan dokumen dengan ID kustom
+ * (mis. 'user-admin-1', 'user-mhs-1789...'), BUKAN Firebase Auth UID, sehingga
+ * pencocokan profil harus dilakukan dengan:
+ *   1. Dokumen langsung bernama auth UID, lalu
+ *   2. Pencarian menyeluruh dokumen users yang cocok (email / username / NIM / NIDN / uid).
+ */
+export async function resolveFirebaseUserProfile(firebaseUser) {
+  if (!firebaseUser) return null;
+
+  const authUid = String(firebaseUser.uid || '');
+  const authEmail = String(firebaseUser.email || '').toLowerCase().trim();
+
+  // 1. Coba dokumen langsung dengan Firebase Auth UID sebagai doc id
+  try {
+    const snap = await getDoc(doc(db, 'users', authUid));
+    if (snap.exists() && snap.data().role) {
+      return { id: snap.id, uid: snap.id, ...snap.data() };
+    }
+  } catch (e) {
+    console.warn('resolveFirebaseUserProfile: gagal membaca dokumen by auth uid:', e);
+  }
+
+  // 2. Cari dokumen users yang cocok via email / username / NIM / NIDN / uid
+  try {
+    const snap = await getDocs(collection(db, 'users'));
+    for (const d of snap.docs) {
+      const uData = { id: d.id, uid: d.id, ...d.data() };
+      const uEmail = String(uData.email || '').toLowerCase().trim();
+      const uUser = String(uData.username || '').toLowerCase().trim();
+      const uNim = String(uData.nim || '').toLowerCase().trim();
+      const uNidn = String(uData.nidn || '').toLowerCase().trim();
+      const uKeys = [
+        uEmail, uUser, uNim, uNidn,
+        String(uData.uid || uData.id || uData.email || '')
+      ]
+        .filter(k => k && String(k).trim().length > 0)
+        .map(k => String(k).toLowerCase());
+      const targetKeys = [authEmail, authUid]
+        .filter(k => k && String(k).trim().length > 0)
+        .map(k => String(k).toLowerCase());
+      const isMatch = targetKeys.some(tk => uKeys.includes(tk));
+      if (isMatch) {
+        uData.email = uEmail;
+        uData.uid = uData.uid || uData.id;
+        uData.id = uData.id || uData.uid;
+        return uData;
+      }
+    }
+  } catch (e) {
+    console.warn('resolveFirebaseUserProfile: gagal scan koleksi users:', e);
+  }
+
+  return null;
 }
 
 // =========================================================================
@@ -236,13 +293,11 @@ export async function loginUser(identifier, password) {
       }
 
       if (firebaseUser) {
-        // Ambil profil dari Firestore
+        // Ambil profil dari Firestore (dengan fallback pencarian multi-kriteria
+        // karena ID dokumen users bisa berupa custom ID seperti 'user-admin-1')
         let profile = null;
         try {
-          const profileSnap = await getDoc(doc(db, 'users', firebaseUser.uid));
-          if (profileSnap.exists() && profileSnap.data().role) {
-            profile = profileSnap.data();
-          }
+          profile = await resolveFirebaseUserProfile(firebaseUser);
         } catch (e) {
           console.warn('Gagal membaca profil dari Firestore:', e);
         }
@@ -273,7 +328,12 @@ export async function loginUser(identifier, password) {
           throw new Error('Akun Anda berstatus non-aktif / dibekukan. Silakan hubungi Administrator STIE Nasional.');
         }
 
-        const cloudUser = { ...profile, uid: firebaseUser.uid, id: firebaseUser.uid, email: firebaseUser.email };
+        const cloudUser = {
+          ...profile,
+          uid: profile.uid || profile.id || firebaseUser.uid,
+          id: profile.id || profile.uid || firebaseUser.uid,
+          email: firebaseUser.email || profile.email
+        };
         localStorage.setItem('STIE_LMS_ACTIVE_USER', JSON.stringify(cloudUser));
         recordUserActivity();
         localStorage.removeItem('STIE_LMS_SESSION_EXPIRED');
@@ -290,13 +350,9 @@ export async function loginUser(identifier, password) {
       const userCredential = await signInWithEmailAndPassword(auth, normalizedEmail, rawPass);
       const user = userCredential.user;
 
-      const userDocRef = doc(db, "users", user.uid);
-      let userSnap = await getDoc(userDocRef);
-      let userData = null;
+      let userData = await resolveFirebaseUserProfile(user);
 
-      if (userSnap.exists() && userSnap.data().role) {
-        userData = userSnap.data();
-      } else {
+      if (!userData || !userData.role) {
         // Cari apakah ada data awal yang cocok dengan email ini di INITIAL_USERS
         const matchSeed = INITIAL_USERS.find(
           u => (u.email || '').toLowerCase() === normalizedEmail.toLowerCase()
@@ -311,7 +367,7 @@ export async function loginUser(identifier, password) {
           };
           delete syncData.password;
           try {
-            await setDoc(userDocRef, syncData, { merge: true });
+            await setDoc(doc(db, 'users', user.uid), syncData, { merge: true });
             userData = syncData;
           } catch (e) {
             userData = syncData;
@@ -543,7 +599,8 @@ export async function requestPasswordReset(identifier) {
 
 /**
  * Reset Kata Sandi Langsung secara Aman (Self-Service Direct Password Reset)
- * Digunakan jika layanan email Firebase eksternal tidak aktif atau kuota habis
+ * - Mode Firebase (produksi): kirim tautan reset password ke email akun via Firebase Auth
+ * - Mode lokal / demo: atur kata sandi langsung pada akun lokal
  */
 export async function directResetPassword(identifier, newPassword) {
   const rawId = (identifier || '').trim();
@@ -557,22 +614,15 @@ export async function directResetPassword(identifier, newPassword) {
     throw new Error("Kata sandi baru minimal 6 karakter.");
   }
 
+  // Mode produksi / Firebase: kirim tautan reset password ke alamat email akun
   if (isRealFirebaseConfigured() && auth) {
-    if (!trimmed.includes('@')) {
-      throw new Error('Untuk keamanan, reset password Firebase harus menggunakan alamat email akun.');
-    }
-    await sendPasswordResetEmail(auth, trimmed);
-    return { success: true, email: trimmed, sentViaFirebase: true };
+    const targetEmail = trimmed.includes('@') ? trimmed : `${trimmed}@lms.stienas.ac.id`;
+    await sendPasswordResetEmail(auth, targetEmail);
+    return { success: true, email: targetEmail, sentViaFirebase: true, method: 'RESET_EMAIL' };
   }
 
-  let list = [];
-  try {
-    list = await getUsers();
-  } catch (e) {
-    const stored = localStorage.getItem('STIE_LMS_USERS');
-    list = stored ? JSON.parse(stored) : [...INITIAL_USERS];
-  }
-
+  // Mode lokal / demo: atur kata sandi langsung pada akun lokal
+  const list = await getUsers();
   const target = list.find(u => 
     (u.email && u.email.toLowerCase().trim() === trimmed) ||
     (u.aliasEmail && u.aliasEmail.toLowerCase().trim() === trimmed) ||
@@ -588,8 +638,17 @@ export async function directResetPassword(identifier, newPassword) {
   }
 
   const targetUid = target.uid || target.id;
+  const updatedList = list.map(u => {
+    const sameUid = u.uid === targetUid || u.id === targetUid;
+    const sameEmail = u.email && String(u.email).toLowerCase().trim() === String(target.email || '').toLowerCase().trim();
+    if (sameUid || sameEmail) {
+      return { ...u, password: cleanPass };
+    }
+    return u;
+  });
 
-  throw new Error('Reset password lokal dinonaktifkan. Gunakan Firebase Authentication.');
+  await setLocal(STORAGE_KEYS.USERS, updatedList);
+  return { success: true, email: target.email, sentViaFirebase: false, method: 'LOCAL' };
 }
 
 export { registerStudent } from './firestoreService.js';

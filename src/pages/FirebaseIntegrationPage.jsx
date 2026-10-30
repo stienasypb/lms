@@ -7,7 +7,7 @@ import {
   auth,
   db 
 } from '../firebase/config';
-import { syncCollectionsToLiveFirestore } from '../firebase/firestoreService';
+import { syncCollectionsToLiveFirestore, syncAllUsersToFirebaseAuth } from '../firebase/firestoreService';
 import { 
   Database, 
   Flame, 
@@ -117,8 +117,19 @@ export default function FirebaseIntegrationPage() {
     setSyncing(true);
     setSyncLogs([]);
     try {
+      // 1. Sinkronisasi seluruh akun users terdaftar ke Firebase Authentication
+      //    agar seluruh data akun di Firestore dapat login kembali.
+      const authSync = await syncAllUsersToFirebaseAuth();
+      setSyncLogs(prev => [
+        ...(prev || []),
+        `Sinkronisasi Firebase Auth selesai: ${authSync.created.length} akun baru dibuat, ${authSync.existing.length} akun sudah terdaftar, ${authSync.failed.length} gagal.`,
+        ...authSync.created.map(c => `✅ CREATED: ${c.email}`),
+        ...authSync.failed.map(f => `❌ FAILED: ${f.email} (${f.reason})`)
+      ]);
+
+      // 2. Sinkronisasi koleksi ke Cloud Firestore
       const res = await syncCollectionsToLiveFirestore((msg, logs) => {
-        setSyncLogs([...logs]);
+        setSyncLogs(prev => [...(prev || []), ...logs]);
       });
       showSuccessAlert("Sinkronisasi Selesai", "Inisialisasi koleksi Cloud Firestore selesai dengan sukses!");
     } catch (err) {

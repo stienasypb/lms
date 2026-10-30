@@ -1,13 +1,13 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import { onAuthStateChanged } from 'firebase/auth';
-import { doc, getDoc } from 'firebase/firestore';
 import { 
   getCurrentUser, 
   loginUser, 
   logoutUser, 
   SESSION_TIMEOUT_MS, 
   WARNING_BEFORE_TIMEOUT_MS, 
-  recordUserActivity 
+  recordUserActivity,
+  resolveFirebaseUserProfile 
 } from '../firebase/authService';
 import { auth, db, isRealFirebaseConfigured } from '../firebase/config';
 import { subscribeToDocFirestore } from '../firebase/firestoreService';
@@ -37,13 +37,13 @@ export function AuthProvider({ children }) {
         return;
       }
       try {
-        const profileSnap = await getDoc(doc(db, 'users', firebaseUser.uid));
-        if (!profileSnap.exists() || !profileSnap.data().role) {
+        const profile = await resolveFirebaseUserProfile(firebaseUser);
+        if (!profile || !profile.role) {
           setUser(current => current?.uid === firebaseUser.uid && current?.role ? current : null);
           return;
         }
-        const profile = profileSnap.data();
-        setUser({ ...profile, uid: firebaseUser.uid, id: firebaseUser.uid, email: firebaseUser.email });
+        const userProfile = { ...profile, uid: profile.uid || profile.id || firebaseUser.uid, id: profile.id || profile.uid || firebaseUser.uid, email: firebaseUser.email || profile.email };
+        setUser(userProfile);
       } catch (error) {
         console.warn('Gagal memuat profil Firebase:', error);
         setUser(null);

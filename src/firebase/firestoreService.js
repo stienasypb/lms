@@ -21,7 +21,7 @@ import {
   arrayUnion
 } from "firebase/firestore";
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
-import { createUserWithEmailAndPassword } from "firebase/auth";
+import { createUserWithEmailAndPassword, sendPasswordResetEmail } from "firebase/auth";
 import { auth, db, storage, isRealFirebaseConfigured } from "./config.js";
 import { 
   INITIAL_FAKULTAS, 
@@ -1140,6 +1140,57 @@ export async function getUsers() {
   return await getLocal(STORAGE_KEYS.USERS, INITIAL_USERS);
 }
 
+/**
+ * Sinkronisasi seluruh akun pengguna yang terdaftar (Firestore / seed / lokal)
+ * ke Firebase Authentication. Akun yang belum memiliki identitas di Firebase Auth
+ * akan dibuat secara otomatis (akun yang sudah ada tidak akan di-reset password-nya).
+ * Cocok untuk memastikan seluruh data akun terdaftar dapat login kembali.
+ */
+export async function syncAllUsersToFirebaseAuth() {
+  if (!isCloudSessionActive() || !auth) {
+    throw new Error('Firebase Authentication belum aktif / belum terkonfigurasi.');
+  }
+
+  const users = await getUsers();
+  const results = { total: (users || []).length, created: [], existing: [], failed: [] };
+
+  const defaultPasswordForRole = (role) => {
+    const r = String(role || '').toUpperCase();
+    if (r.includes('ADMIN_AKADEMIK')) return 'akademik123';
+    if (r === 'SUPER_ADMIN' || r === 'ADMIN' || r === 'BAA') return 'admin126';
+    if (r === 'DOSEN') return 'stienas2026';
+    return 'mhs123';
+  };
+
+  for (const u of users) {
+    const email = String(u.email || '').trim().toLowerCase();
+    let finalEmail = email;
+    if (!finalEmail) {
+      if (u.username) finalEmail = `${String(u.username).trim().toLowerCase()}@lms.stienas.ac.id`;
+      else if (u.nim) finalEmail = `${String(u.nim).trim()}@lms.stienas.ac.id`;
+    }
+    if (!finalEmail || !finalEmail.includes('@')) {
+      results.failed.push({ email: u.email || u.username || u.nim || u.uid || u.id, reason: 'TIDAK_ADA_EMAIL' });
+      continue;
+    }
+    const cleanEmail = finalEmail.toLowerCase();
+    const password = String(u.password || '').trim() || defaultPasswordForRole(u.role);
+
+    try {
+      const credential = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+      results.created.push({ email: cleanEmail, uid: credential.user.uid });
+    } catch (e) {
+      if (e?.code === 'auth/email-already-in-use') {
+        results.existing.push({ email: cleanEmail });
+      } else {
+        results.failed.push({ email: cleanEmail, reason: e?.code || e?.message });
+      }
+    }
+  }
+
+  return results;
+}
+
 export async function createUser(userData, currentUser) {
   const list = await getLocal(STORAGE_KEYS.USERS, INITIAL_USERS);
   const currentRole = (currentUser?.role || '').toUpperCase();
@@ -1193,11 +1244,26 @@ export async function createUser(userData, currentUser) {
     }
   } catch (e) {}
 
+  // 0. Pastikan akun baru memiliki identitas Firebase Authentication.
+  //    Akun yang dibuat lewat admin (UserManagement / BatchImport) wajib memiliki
+  //    akun di Firebase Auth agar dapat login; kalau belum ada, lakukan auto-create.
+  if (isCloudSessionActive() && auth && (userData.password || '').trim().length >= 6) {
+    try {
+      const fbCredential = await createUserWithEmailAndPassword(auth, targetEmail, (userData.password || '').trim());
+      newUser.uid = fbCredential.user.uid;
+      newUser.id = fbCredential.user.uid;
+      console.log('Akun berhasil di-auto-create ke Firebase Auth:', targetEmail, fbCredential.user.uid);
+    } catch (authErr) {
+      // auth/email-already-in-use -> akun mungkin sudah terdaftar di Firebase Auth
+      console.warn('Firebase Auth createUser warning (mungkin akun sudah ada):', authErr.code || authErr.message);
+    }
+  }
+
   // Direct Firestore write attempt jika online
   if (isCloudSessionActive()) {
     try {
       const cleanFbDoc = JSON.parse(JSON.stringify(newUser));
-      await setDoc(doc(db, "users", newUid), cleanFbDoc, { merge: true });
+      await setDoc(doc(db, "users", String(newUser.uid || newUser.id || newUid)), cleanFbDoc, { merge: true });
     } catch (e) {
       console.warn("Direct Firestore createUser setDoc warning (data tetap tersimpan di lokal):", e);
     }
@@ -1252,6 +1318,8 @@ export async function updateUser(uid, userData, currentUser) {
     cleanUserData.nim = String(cleanUserData.nim || '').replace(/\D/g, '');
   }
   // Password dikelola Firebase Authentication, bukan profil Firestore.
+  // Catatan: password TIDAK pernah disimpan ke dokumen Firestore.
+  const newPassword = (userData.password || '').trim();
   delete cleanUserData.password;
 
   // Jika akun adalah Mahasiswa, sinkronkan semester berdasarkan angkatan/NIM
@@ -1270,6 +1338,21 @@ export async function updateUser(uid, userData, currentUser) {
       await setDoc(doc(db, "users", String(uid)), cleanUserData, { merge: true });
     } catch (e) {
       console.warn("Direct Firestore updateUser setDoc warning:", e);
+    }
+  }
+
+  // Reset Kata Sandi melalui Firebase Authentication: password tidak bisa ditulis
+  // langsung ke dokumen Firestore, sehingga admin mengirim tautan reset password ke
+  // alamat email akun yang bersangkutan agar pengguna dapat menetapkan sandi baru.
+  if (newPassword && isCloudSessionActive() && auth) {
+    // Email akun yang terikat di Firebase Auth (nilai terakhir sebelum update)
+    const resetEmail = String(target.email || cleanUserData.email || '').trim().toLowerCase();
+    if (resetEmail) {
+      try {
+        await sendPasswordResetEmail(auth, resetEmail);
+      } catch (resetErr) {
+        console.warn("Gagal mengirim reset password via Firebase Auth:", resetErr?.code || resetErr?.message);
+      }
     }
   }
 

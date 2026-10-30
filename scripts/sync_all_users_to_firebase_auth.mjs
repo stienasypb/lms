@@ -86,7 +86,7 @@ async function syncAllUsers() {
       } else if ((u.role || '').toUpperCase() === 'DOSEN') {
         password = 'stienas2026';
       } else {
-        password = 'mhs12345';
+        password = 'mhs123';
       }
     }
 
