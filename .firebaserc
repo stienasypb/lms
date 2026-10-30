@@ -1,0 +1,15 @@
+{
+  "projects": {
+    "default": "lms-stienas"
+  },
+  "targets": {
+    "lms-stienas": {
+      "hosting": {
+        "lms-stienasbjm": [
+          "lms-stienasbjm"
+        ]
+      }
+    }
+  },
+  "etags": {}
+}
